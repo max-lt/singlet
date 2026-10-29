@@ -63,8 +63,12 @@ cargo run --example stock
 - `ctx.set_alarm(at)` sets the one alarm of an instance. At `at`, the
   runtime runs `Actor::alarm` as a turn, also after a restart and also if
   the instance stopped. The alarm is cleared before that turn.
-- A failed alarm turn keeps the alarm. The runtime tries again after 1 s,
-  then doubles the wait up to 60 s. An alarm can run more than once.
+- A failed alarm turn keeps the alarm. The runtime tries again after
+  `Options::alarm_backoff` (1 s), then doubles the wait up to 60 s, for
+  `Options::alarm_retries` (6) tries. The last try deletes the alarm before
+  it runs, so its failure drops the alarm. An alarm can run more than once.
+- Above `Options::mailbox` (1024) waiting calls for one key, a call fails at
+  once with `Error::Overloaded`.
 - A panic stops the instance. Its caller gets `Error::Stopped`. Calls that
   wait in the mailbox go to the new instance.
 - `Runtime::open` must run inside a Tokio runtime.

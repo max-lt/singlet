@@ -10,6 +10,8 @@ use singlet_core::Options;
 use singlet_core::Runtime;
 
 const IDLE: Duration = Duration::from_millis(50);
+const BACKOFF: Duration = Duration::from_millis(100);
+const RETRIES: u32 = 2;
 
 enum Cmd {
     /// Sets the alarm this far in the future.
@@ -19,6 +21,8 @@ enum Cmd {
     Disarm,
     /// Returns the number of alarm turns that committed.
     Fired,
+    /// Returns 1 if the alarm is set, else 0.
+    Pending,
 }
 
 /// Fails the alarm turn while `failures` is above zero.
@@ -41,6 +45,7 @@ impl Actor for Clock {
             }
             Cmd::Disarm => ctx.delete_alarm()?,
             Cmd::Fired => {}
+            Cmd::Pending => return Ok(u64::from(ctx.alarm()?.is_some())),
         }
 
         fired(ctx)
@@ -73,6 +78,8 @@ fn open(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Result<Runtime
         dir.path(),
         Options {
             idle: IDLE,
+            alarm_backoff: BACKOFF,
+            alarm_retries: RETRIES,
             ..Options::default()
         },
         move |_| Clock { failures },
@@ -172,11 +179,29 @@ async fn a_failed_alarm_runs_again() {
 
     rt.call("job", Cmd::Arm(Duration::ZERO)).await.unwrap();
 
-    // The first run fails; the second comes after the 1 s backoff.
-    tokio::time::sleep(MS(300)).await;
+    // The first run fails; the second comes after BACKOFF.
+    tokio::time::sleep(MS(50)).await;
     assert_eq!(rt.call("job", Cmd::Fired).await.unwrap(), 0);
 
-    tokio::time::sleep(MS(1200)).await;
+    tokio::time::sleep(MS(300)).await;
     assert_eq!(rt.call("job", Cmd::Fired).await.unwrap(), 1);
     assert_eq!(FAILURES.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_alarm_that_always_fails_is_dropped_after_the_retries() {
+    static FAILURES: AtomicU32 = AtomicU32::new(100);
+    let dir = tempfile::tempdir().unwrap();
+    let rt = open(&dir, &FAILURES).unwrap();
+
+    rt.call("job", Cmd::Arm(Duration::ZERO)).await.unwrap();
+
+    // The tries come at 0, BACKOFF and 3 * BACKOFF.
+    tokio::time::sleep(MS(800)).await;
+    assert_eq!(FAILURES.load(Ordering::SeqCst), 100 - (RETRIES + 1));
+    assert_eq!(rt.call("job", Cmd::Pending).await.unwrap(), 0);
+
+    tokio::time::sleep(MS(500)).await;
+    assert_eq!(FAILURES.load(Ordering::SeqCst), 100 - (RETRIES + 1));
+    assert_eq!(rt.call("job", Cmd::Fired).await.unwrap(), 0);
 }

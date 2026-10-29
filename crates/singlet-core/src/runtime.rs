@@ -21,7 +21,6 @@ use crate::Options;
 use crate::alarm;
 use crate::alarm::Index;
 
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Routes calls to one instance per key, and wakes instances for their
@@ -74,7 +73,13 @@ struct Entry<A: Actor> {
 enum Job<A: Actor> {
     Call(A::Msg, oneshot::Sender<Response<A>>),
     // A dropped sender means the alarm did not run.
-    Alarm(oneshot::Sender<Result<(), Error>>),
+    Alarm(OnFailure, oneshot::Sender<Result<(), Error>>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum OnFailure {
+    Retry,
+    Drop,
 }
 
 enum Response<A: Actor> {
@@ -142,9 +147,9 @@ impl<A: Actor> Runtime<A> {
         }
     }
 
-    async fn alarm(&self, key: &A::Key) -> Result<(), Error> {
+    async fn alarm(&self, key: &A::Key, on_failure: OnFailure) -> Result<(), Error> {
         let (done, rx) = oneshot::channel();
-        self.send(key, Job::Alarm(done))?;
+        self.send(key, Job::Alarm(on_failure, done))?;
 
         rx.await.unwrap_or(Err(Error::Stopped))
     }
@@ -252,7 +257,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
         Err(e) => {
             match mailbox.rx.try_recv().expect("send puts the first job in") {
                 Job::Call(_, reply) => reply.send(Response::Done(Err(e))).ok(),
-                Job::Alarm(done) => done.send(Err(e)).ok(),
+                Job::Alarm(_, done) => done.send(Err(e)).ok(),
             };
 
             return;
@@ -280,8 +285,8 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
 
                 failed
             }
-            Job::Alarm(done) => {
-                let result = alarm_turn(&mut actor, &mut ctx).await;
+            Job::Alarm(on_failure, done) => {
+                let result = alarm_turn(&mut actor, &mut ctx, on_failure).await;
 
                 let failed = result.is_err();
                 done.send(result).ok();
@@ -296,13 +301,23 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
     }
 }
 
-async fn alarm_turn<A: Actor>(actor: &mut A, ctx: &mut Ctx) -> Result<(), Error> {
+async fn alarm_turn<A: Actor>(
+    actor: &mut A,
+    ctx: &mut Ctx,
+    on_failure: OnFailure,
+) -> Result<(), Error> {
     // The index wakes an object early, never late; the file decides.
     if ctx.alarm_ms()?.is_none_or(|at| at > alarm::now_ms()) {
         return ctx.sync_index();
     }
 
     ctx.delete_alarm()?;
+
+    // The last try commits the delete first, so its failure drops the alarm.
+    if on_failure == OnFailure::Drop {
+        ctx.commit().await?;
+    }
+
     actor.alarm(ctx).await?;
 
     ctx.commit().await
@@ -338,7 +353,7 @@ async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
 }
 
 async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8>) {
-    let mut backoff = MIN_BACKOFF;
+    let mut failures = 0;
 
     loop {
         let Some(inner) = inner.upgrade() else {
@@ -350,12 +365,30 @@ async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8
             break;
         };
 
-        if (Runtime { inner }).alarm(&decoded).await.is_ok() {
+        let Options {
+            alarm_retries,
+            alarm_backoff,
+            ..
+        } = inner.options;
+
+        let on_failure = if failures < alarm_retries {
+            OnFailure::Retry
+        } else {
+            OnFailure::Drop
+        };
+
+        let ok = (Runtime { inner })
+            .alarm(&decoded, on_failure)
+            .await
+            .is_ok();
+
+        if ok || on_failure == OnFailure::Drop {
             break;
         }
 
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+        let backoff = alarm_backoff.saturating_mul(1 << failures.min(16));
+        tokio::time::sleep(backoff.min(MAX_BACKOFF)).await;
+        failures += 1;
     }
 
     index.delivered(&key);

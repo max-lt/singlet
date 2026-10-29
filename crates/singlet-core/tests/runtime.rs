@@ -202,6 +202,7 @@ async fn a_full_mailbox_refuses_the_call() {
     let options = Options {
         idle: IDLE,
         mailbox: 2,
+        ..Options::default()
     };
     let rt = Runtime::open(dir.path(), options, |_| Counter::default()).unwrap();
 
