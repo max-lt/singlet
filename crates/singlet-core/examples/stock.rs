@@ -22,6 +22,7 @@ enum Outcome {
 struct Stock;
 
 impl Actor for Stock {
+    type Key = u64;
     type Msg = Command;
     type Reply = Outcome;
 
@@ -52,12 +53,12 @@ async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
     let rt = Runtime::open(dir.path(), Duration::from_secs(60), |_| Stock)?;
 
-    rt.call("sku-42", Command::Restock).await?;
+    rt.call(&42, Command::Restock).await?;
 
     let buyers: Vec<_> = (0..50)
         .map(|_| {
             let rt = rt.clone();
-            tokio::spawn(async move { rt.call("sku-42", Command::Buy).await })
+            tokio::spawn(async move { rt.call(&42, Command::Buy).await })
         })
         .collect();
 

@@ -16,6 +16,7 @@ use singlet_core::{Actor, Ctx, Error, Runtime};
 struct Counter;
 
 impl Actor for Counter {
+    type Key = String;
     type Msg = ();
     type Reply = u64;
 
@@ -50,6 +51,8 @@ cargo run --example stock
 - A runtime starts the instance of a key on the first call. It stops the
   instance after the idle time with no calls.
 - `Msg` and `Reply` move in memory; there is no serialization.
+- `Key::encode` names the storage file of a key. It must give different
+  bytes for different keys, and the same bytes in every version.
 - One call to `handle` is a turn. Calls for one key do not interleave, also
   across an `await`. Calls for different keys run in parallel.
 - The writes of a turn commit when `handle` returns `Ok`, before the caller

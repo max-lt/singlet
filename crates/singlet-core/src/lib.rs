@@ -6,10 +6,12 @@
 
 mod ctx;
 mod error;
+mod key;
 mod runtime;
 
 pub use ctx::Ctx;
 pub use error::Error;
+pub use key::Key;
 pub use runtime::Runtime;
 
 /// The code of one instance.
@@ -18,6 +20,7 @@ pub use runtime::Runtime;
 /// returns `Ok`, before the caller gets the reply. A turn that returns `Err`
 /// discards its writes and the instance, so memory and storage stay in step.
 pub trait Actor: Send + 'static {
+    type Key: Key;
     type Msg: Send + 'static;
     type Reply: Send + 'static;
 

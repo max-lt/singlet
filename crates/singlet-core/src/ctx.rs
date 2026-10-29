@@ -7,19 +7,18 @@ use sha2::Sha256;
 
 use crate::Error;
 
-/// The key and the storage of one instance.
+/// The storage of one instance.
 ///
 /// Reads see the writes of the current turn. The runtime commits or discards
 /// these writes at the end of the turn.
 pub struct Ctx {
-    key: String,
     conn: Connection,
     writing: bool,
 }
 
 impl Ctx {
-    pub(crate) fn open(dir: &Path, key: String) -> Result<Self, Error> {
-        let name: String = Sha256::digest(key.as_bytes())
+    pub(crate) fn open(dir: &Path, key: &[u8]) -> Result<Self, Error> {
+        let name: String = Sha256::digest(key)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
@@ -32,14 +31,9 @@ impl Ctx {
         )?;
 
         Ok(Self {
-            key,
             conn,
             writing: false,
         })
-    }
-
-    pub fn key(&self) -> &str {
-        &self.key
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {

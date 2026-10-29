@@ -10,9 +10,12 @@ use singlet_core::Ctx;
 use singlet_core::Error;
 use singlet_core::Runtime;
 
-struct Ledger;
+struct Ledger {
+    company: String,
+}
 
 impl Actor for Ledger {
+    type Key = String;
     type Msg = String;
     type Reply = String;
 
@@ -22,7 +25,7 @@ impl Actor for Ledger {
             None => 1,
         };
 
-        let number = format!("{}-{next:06}", ctx.key());
+        let number = format!("{}-{next:06}", self.company);
         ctx.put("next", &(next + 1).to_le_bytes())?;
         ctx.put(&number, body.as_bytes())?;
 
@@ -37,7 +40,11 @@ impl Actor for Ledger {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
-    let rt = Runtime::open(dir.path(), Duration::from_secs(60), |_| Ledger)?;
+    let rt = Runtime::open(dir.path(), Duration::from_secs(60), |company: &String| {
+        Ledger {
+            company: company.clone(),
+        }
+    })?;
 
     let invoices = ["120 EUR", "", "80 EUR", "45 EUR"];
 

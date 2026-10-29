@@ -20,6 +20,7 @@ struct Bucket {
 }
 
 impl Actor for Bucket {
+    type Key = String;
     type Msg = ();
     type Reply = u16;
 

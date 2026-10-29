@@ -27,6 +27,7 @@ struct Counter {
 }
 
 impl Actor for Counter {
+    type Key = String;
     type Msg = Cmd;
     type Reply = Count;
 

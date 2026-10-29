@@ -1,6 +1,8 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::TryLockError;
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -12,6 +14,7 @@ use tokio::sync::oneshot;
 use crate::Actor;
 use crate::Ctx;
 use crate::Error;
+use crate::Key;
 
 /// Routes calls to one instance per key.
 ///
@@ -29,16 +32,18 @@ impl<A: Actor> Clone for Runtime<A> {
     }
 }
 
+type Make<A> = Box<dyn Fn(&<A as Actor>::Key) -> A + Send + Sync>;
+
 struct Inner<A: Actor> {
     objects: PathBuf,
     idle: Duration,
-    make: Box<dyn Fn(&str) -> A + Send + Sync>,
+    make: Make<A>,
     registry: Arc<Mutex<Registry<A>>>,
     _lock: File,
 }
 
 struct Registry<A: Actor> {
-    entries: HashMap<String, Entry<A>>,
+    entries: HashMap<A::Key, Entry<A>>,
     next_id: u64,
 }
 
@@ -63,7 +68,7 @@ impl<A: Actor> Runtime<A> {
     pub fn open(
         dir: impl Into<PathBuf>,
         idle: Duration,
-        make: impl Fn(&str) -> A + Send + Sync + 'static,
+        make: impl Fn(&A::Key) -> A + Send + Sync + 'static,
     ) -> Result<Self, Error> {
         let dir = dir.into();
         let objects = dir.join("objects");
@@ -92,7 +97,11 @@ impl<A: Actor> Runtime<A> {
     }
 
     /// Sends `msg` to the instance of `key` and waits for its reply.
-    pub async fn call(&self, key: &str, mut msg: A::Msg) -> Result<A::Reply, Error> {
+    pub async fn call<Q>(&self, key: &Q, mut msg: A::Msg) -> Result<A::Reply, Error>
+    where
+        A::Key: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
+    {
         loop {
             let (reply, rx) = oneshot::channel();
             self.send(key, Envelope { msg, reply });
@@ -107,7 +116,11 @@ impl<A: Actor> Runtime<A> {
 
     // Sends under the registry lock, so an instance that finds its mailbox
     // empty under the same lock can stop without losing a message.
-    fn send(&self, key: &str, env: Envelope<A>) {
+    fn send<Q>(&self, key: &Q, env: Envelope<A>)
+    where
+        A::Key: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
+    {
         let mut registry = self.inner.registry.lock().unwrap();
 
         if let Some(entry) = registry.entries.get(key) {
@@ -124,10 +137,11 @@ impl<A: Actor> Runtime<A> {
 
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(env).unwrap();
-        registry.entries.insert(key.to_owned(), Entry { id, tx });
+        let key = key.to_owned();
+        registry.entries.insert(key.clone(), Entry { id, tx });
 
         let mailbox = Mailbox {
-            key: key.to_owned(),
+            key,
             id,
             rx,
             registry: self.inner.registry.clone(),
@@ -141,7 +155,7 @@ impl<A: Actor> Runtime<A> {
 /// drops, also on a panic. A new instance of the key can start only after
 /// that.
 struct Mailbox<A: Actor> {
-    key: String,
+    key: A::Key,
     id: u64,
     rx: mpsc::UnboundedReceiver<Envelope<A>>,
     registry: Arc<Mutex<Registry<A>>>,
@@ -193,7 +207,7 @@ async fn run<A: Actor>(inner: Arc<Inner<A>>, mut mailbox: Mailbox<A>) {
 }
 
 async fn serve<A: Actor>(inner: &Inner<A>, mailbox: &mut Mailbox<A>) {
-    let mut ctx = match Ctx::open(&inner.objects, mailbox.key.clone()) {
+    let mut ctx = match Ctx::open(&inner.objects, &mailbox.key.encode()) {
         Ok(ctx) => ctx,
         Err(e) => {
             let env = mailbox.rx.try_recv().unwrap();
