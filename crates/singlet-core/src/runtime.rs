@@ -6,6 +6,7 @@ use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -15,8 +16,14 @@ use crate::Actor;
 use crate::Ctx;
 use crate::Error;
 use crate::Key;
+use crate::alarm;
+use crate::alarm::Index;
 
-/// Routes calls to one instance per key.
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Routes calls to one instance per key, and wakes instances for their
+/// alarms.
 ///
 /// One runtime owns its data directory; a second `open` on the same
 /// directory fails with [`Error::Locked`], even from another process. The
@@ -41,7 +48,15 @@ struct Inner<A: Actor> {
     idle: Duration,
     make: Make<A>,
     registry: Mutex<Registry<A>>,
+    index: Arc<Index>,
     _lock: File,
+}
+
+impl<A: Actor> Drop for Inner<A> {
+    fn drop(&mut self) {
+        // Wakes the scheduler, so it sees that the runtime is gone.
+        self.index.wake.notify_one();
+    }
 }
 
 struct Registry<A: Actor> {
@@ -51,12 +66,13 @@ struct Registry<A: Actor> {
 
 struct Entry<A: Actor> {
     id: u64,
-    tx: mpsc::UnboundedSender<Envelope<A>>,
+    tx: mpsc::UnboundedSender<Job<A>>,
 }
 
-struct Envelope<A: Actor> {
-    msg: A::Msg,
-    reply: oneshot::Sender<Response<A>>,
+enum Job<A: Actor> {
+    Call(A::Msg, oneshot::Sender<Response<A>>),
+    // A dropped sender means the alarm did not run.
+    Alarm(oneshot::Sender<Result<(), Error>>),
 }
 
 enum Response<A: Actor> {
@@ -67,6 +83,8 @@ enum Response<A: Actor> {
 impl<A: Actor> Runtime<A> {
     /// Stops an instance after `idle` without calls. `make` builds the
     /// instance of a key each time it starts.
+    ///
+    /// Must run inside a Tokio runtime: it starts the alarm scheduler.
     pub fn open(
         dir: impl Into<PathBuf>,
         idle: Duration,
@@ -84,18 +102,23 @@ impl<A: Actor> Runtime<A> {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
 
-        Ok(Self {
-            inner: Arc::new(Inner {
-                objects,
-                idle,
-                make: Box::new(make),
-                registry: Mutex::new(Registry {
-                    entries: HashMap::new(),
-                    next_id: 0,
-                }),
-                _lock: lock,
+        let index = Arc::new(Index::open(&dir.join("alarms.sqlite"))?);
+
+        let inner = Arc::new(Inner {
+            objects,
+            idle,
+            make: Box::new(make),
+            registry: Mutex::new(Registry {
+                entries: HashMap::new(),
+                next_id: 0,
             }),
-        })
+            index: index.clone(),
+            _lock: lock,
+        });
+
+        tokio::spawn(schedule(Arc::downgrade(&inner), index));
+
+        Ok(Self { inner })
     }
 
     /// Sends `msg` to the instance of `key` and waits for its reply.
@@ -106,7 +129,7 @@ impl<A: Actor> Runtime<A> {
     {
         loop {
             let (reply, rx) = oneshot::channel();
-            self.send(key, Envelope { msg, reply });
+            self.send(key, Job::Call(msg, reply));
 
             match rx.await {
                 Ok(Response::Done(result)) => return result,
@@ -116,9 +139,16 @@ impl<A: Actor> Runtime<A> {
         }
     }
 
+    async fn alarm(&self, key: &A::Key) -> Result<(), Error> {
+        let (done, rx) = oneshot::channel();
+        self.send(key, Job::Alarm(done));
+
+        rx.await.unwrap_or(Err(Error::Stopped))
+    }
+
     // Sends under the registry lock, so an instance that finds its mailbox
     // empty under the same lock can stop without losing a message.
-    fn send<Q>(&self, key: &Q, env: Envelope<A>)
+    fn send<Q>(&self, key: &Q, job: Job<A>)
     where
         A::Key: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
@@ -128,7 +158,7 @@ impl<A: Actor> Runtime<A> {
         if let Some(entry) = registry.entries.get(key) {
             entry
                 .tx
-                .send(env)
+                .send(job)
                 .unwrap_or_else(|_| unreachable!("a mailbox closes after its entry goes"));
 
             return;
@@ -138,7 +168,7 @@ impl<A: Actor> Runtime<A> {
         registry.next_id += 1;
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(env).unwrap();
+        tx.send(job).unwrap();
         let key = key.to_owned();
         registry.entries.insert(key.clone(), Entry { id, tx });
 
@@ -159,7 +189,7 @@ impl<A: Actor> Runtime<A> {
 struct Mailbox<A: Actor> {
     key: A::Key,
     id: u64,
-    rx: mpsc::UnboundedReceiver<Envelope<A>>,
+    rx: mpsc::UnboundedReceiver<Job<A>>,
     inner: Arc<Inner<A>>,
 }
 
@@ -194,8 +224,10 @@ impl<A: Actor> Drop for Mailbox<A> {
         self.remove_entry(&mut registry);
         drop(registry);
 
-        while let Ok(env) = self.rx.try_recv() {
-            env.reply.send(Response::Retry(env.msg)).ok();
+        while let Ok(job) = self.rx.try_recv() {
+            if let Job::Call(msg, reply) = job {
+                reply.send(Response::Retry(msg)).ok();
+            }
         }
     }
 }
@@ -209,11 +241,13 @@ async fn run<A: Actor>(mut mailbox: Mailbox<A>) {
 async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
     let inner = mailbox.inner.clone();
 
-    let mut ctx = match Ctx::open(&inner.objects, &mailbox.key.encode()) {
+    let mut ctx = match Ctx::open(&inner.objects, mailbox.key.encode(), inner.index.clone()) {
         Ok(ctx) => ctx,
         Err(e) => {
-            let env = mailbox.rx.try_recv().expect("send puts the first call in");
-            env.reply.send(Response::Done(Err(e))).ok();
+            match mailbox.rx.try_recv().expect("send puts the first job in") {
+                Job::Call(_, reply) => reply.send(Response::Done(Err(e))).ok(),
+                Job::Alarm(done) => done.send(Err(e)).ok(),
+            };
 
             return;
         }
@@ -222,22 +256,101 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
     let mut actor = (inner.make)(&mailbox.key);
 
     loop {
-        let env = match tokio::time::timeout(inner.idle, mailbox.rx.recv()).await {
-            Ok(env) => env.expect("the entry holds a sender"),
+        let job = match tokio::time::timeout(inner.idle, mailbox.rx.recv()).await {
+            Ok(job) => job.expect("the entry holds a sender"),
             Err(_) if mailbox.retire() => return,
             Err(_) => continue,
         };
 
-        let result = match actor.handle(&mut ctx, env.msg).await {
-            Ok(reply) => ctx.commit().map(|()| reply),
-            Err(e) => Err(e),
-        };
+        let failed = match job {
+            Job::Call(msg, reply) => {
+                let result = match actor.handle(&mut ctx, msg).await {
+                    Ok(value) => ctx.commit().map(|()| value),
+                    Err(e) => Err(e),
+                };
 
-        let failed = result.is_err();
-        env.reply.send(Response::Done(result)).ok();
+                let failed = result.is_err();
+                reply.send(Response::Done(result)).ok();
+
+                failed
+            }
+            Job::Alarm(done) => {
+                let result = alarm_turn(&mut actor, &mut ctx).await;
+
+                let failed = result.is_err();
+                done.send(result).ok();
+
+                failed
+            }
+        };
 
         if failed {
             return;
         }
     }
+}
+
+async fn alarm_turn<A: Actor>(actor: &mut A, ctx: &mut Ctx) -> Result<(), Error> {
+    // The index wakes an object early, never late; the file decides.
+    if ctx.alarm_ms()?.is_none_or(|at| at > alarm::now_ms()) {
+        return ctx.sync_index();
+    }
+
+    ctx.delete_alarm()?;
+    actor.alarm(ctx).await?;
+
+    ctx.commit()
+}
+
+// Holds the runtime only while it reads the index, so a dropped runtime can
+// go away while the scheduler waits.
+async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
+    loop {
+        let next = {
+            let Some(strong) = inner.upgrade() else {
+                return;
+            };
+
+            let now = alarm::now_ms();
+
+            for key in index.take_due(now).expect("alarm index is readable") {
+                tokio::spawn(deliver(Arc::downgrade(&strong), index.clone(), key));
+            }
+
+            index.next_after(now).expect("alarm index is readable")
+        };
+
+        let Some(at) = next else {
+            index.wake.notified().await;
+            continue;
+        };
+
+        let wait = Duration::from_millis((at - alarm::now_ms()).max(0).cast_unsigned());
+
+        tokio::time::timeout(wait, index.wake.notified()).await.ok();
+    }
+}
+
+async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8>) {
+    let mut backoff = MIN_BACKOFF;
+
+    loop {
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
+
+        let Some(decoded) = A::Key::decode(&key) else {
+            index.set(&key, None).ok();
+            break;
+        };
+
+        if (Runtime { inner }).alarm(&decoded).await.is_ok() {
+            break;
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+
+    index.delivered(&key);
 }

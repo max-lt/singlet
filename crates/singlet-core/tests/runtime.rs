@@ -166,8 +166,8 @@ async fn keys_run_in_parallel() {
     assert!(!slow.is_finished());
 }
 
-#[test]
-fn one_runtime_per_directory() {
+#[tokio::test]
+async fn one_runtime_per_directory() {
     let dir = tempfile::tempdir().unwrap();
     let _rt = open(&dir);
 

@@ -41,6 +41,7 @@ let n = rt.call("room-1", ()).await?;
 - `stock`: 50 buyers, 10 items, no overselling.
 - `invoices`: invoice numbers with no gap; a rejected invoice uses no number.
 - `rate_limit`: a token bucket per API key, in memory only.
+- `reminder`: an alarm per order that is not paid in time.
 
 ```sh
 cargo run --example stock
@@ -59,8 +60,14 @@ cargo run --example stock
   gets the reply.
 - A turn that returns `Err` discards its writes and the instance. The next
   call starts a new instance from storage.
+- `ctx.set_alarm(at)` sets the one alarm of an instance. At `at`, the
+  runtime runs `Actor::alarm` as a turn, also after a restart and also if
+  the instance stopped. The alarm is cleared before that turn.
+- A failed alarm turn keeps the alarm. The runtime tries again after 1 s,
+  then doubles the wait up to 60 s. An alarm can run more than once.
 - A panic stops the instance. Its caller gets `Error::Stopped`. Calls that
   wait in the mailbox go to the new instance.
+- `Runtime::open` must run inside a Tokio runtime.
 - One runtime owns its data directory. A second runtime on the same directory
   fails with `Error::Locked`, also from another process. The lock stays until
   the last instance stops.
@@ -70,6 +77,11 @@ cargo run --example stock
 Each key has the file `<dir>/objects/<sha256 of key>.sqlite`, in WAL mode with
 `synchronous=FULL`. A commit waits for fsync. A committed write survives a
 crash of the process. It does not survive the loss of the disk.
+
+The alarm of an object is in its own file. `<dir>/alarms.sqlite` is an index
+of the alarms for the scheduler. An entry is never later than the alarm in
+the file, so a crash between the two writes wakes an object early. The object
+then checks its file and does nothing.
 
 ## Limits
 
