@@ -83,7 +83,8 @@ The `runtime` target checks each reply against a model, with calls, bursts
 and pauses near the idle time.
 
 ```sh
-cargo +nightly fuzz run runtime -- -max_len=512 -len_control=0
+just fuzz       # 300 s
+just fuzz 3600
 ```
 
 ## License
