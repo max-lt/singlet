@@ -9,6 +9,10 @@ pub enum Error {
     #[error("data directory is in use by another runtime")]
     Locked,
 
+    /// A storage file has a format version that this crate does not read.
+    #[error("storage format {0} is not supported")]
+    Format(i64),
+
     /// The mailbox of the key is full. The call did not run.
     #[error("too many calls wait for this key")]
     Overloaded,

@@ -226,6 +226,18 @@ async fn one_runtime_per_directory() {
 }
 
 #[tokio::test]
+async fn a_file_of_another_format_does_not_open() {
+    let dir = tempfile::tempdir().unwrap();
+    rusqlite::Connection::open(dir.path().join("alarms.sqlite"))
+        .unwrap()
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
+
+    let rt = Runtime::open(dir.path(), Options::default(), |_| Counter::default());
+    assert!(matches!(rt, Err(Error::Format(2))));
+}
+
+#[tokio::test]
 async fn a_full_mailbox_refuses_the_call() {
     let dir = tempfile::tempdir().unwrap();
     let options = Options {

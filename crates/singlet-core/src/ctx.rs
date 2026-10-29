@@ -10,6 +10,7 @@ use sha2::Sha256;
 use crate::Error;
 use crate::alarm;
 use crate::alarm::Index;
+use crate::db;
 
 /// The storage of one instance.
 ///
@@ -31,10 +32,8 @@ impl Ctx {
             .map(|b| format!("{b:02x}"))
             .collect();
 
-        let conn = Connection::open(dir.join(format!("{name}.sqlite")))?;
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.execute_batch(
+        let conn = db::open(
+            &dir.join(format!("{name}.sqlite")),
             "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS alarm (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);",
         )?;

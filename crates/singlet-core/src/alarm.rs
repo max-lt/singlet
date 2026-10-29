@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use tokio::sync::Notify;
 
 use crate::Error;
+use crate::db;
 
 /// The alarms of a data directory that are due or will be due.
 ///
@@ -23,10 +24,8 @@ pub(crate) struct Index {
 
 impl Index {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let conn = Connection::open(path)?;
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.execute_batch(
+        let conn = db::open(
+            path,
             "CREATE TABLE IF NOT EXISTS alarms (key BLOB PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS alarms_at ON alarms (at);",
         )?;

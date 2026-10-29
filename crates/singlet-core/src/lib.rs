@@ -6,6 +6,7 @@
 
 mod alarm;
 mod ctx;
+mod db;
 mod error;
 mod key;
 mod options;

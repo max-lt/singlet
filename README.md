@@ -90,6 +90,9 @@ Each key has the file `<dir>/objects/<sha256 of key>.sqlite`, in WAL mode with
 `synchronous=FULL`. A commit waits for fsync. A committed write survives a
 crash of the process. It does not survive the loss of the disk.
 
+Each file keeps its format version in `PRAGMA user_version`. A file with
+another version fails to open with `Error::Format`.
+
 The alarm of an object is in its own file. `<dir>/alarms.sqlite` is an index
 of the alarms for the scheduler. An entry is never later than the alarm in
 the file, so a crash between the two writes wakes an object early. The object
