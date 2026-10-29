@@ -10,6 +10,7 @@ use singlet_core::Options;
 use singlet_core::Runtime;
 
 const IDLE: Duration = Duration::from_millis(50);
+const DEADLINE: Duration = Duration::from_secs(5);
 const BACKOFF: Duration = Duration::from_millis(100);
 const RETRIES: u32 = 2;
 
@@ -108,7 +109,7 @@ async fn an_alarm_survives_a_restart() {
     let rt = open(&dir, &FAILURES).unwrap();
 
     rt.call("job", Cmd::Arm(MS(400))).await.unwrap();
-    rt.shutdown().await;
+    rt.shutdown(DEADLINE).await.unwrap();
 
     let rt = open(&dir, &FAILURES).unwrap();
 
@@ -123,11 +124,15 @@ async fn an_alarm_due_while_no_runtime_runs_fires_on_open() {
     let rt = open(&dir, &FAILURES).unwrap();
 
     rt.call("job", Cmd::Arm(MS(300))).await.unwrap();
-    rt.shutdown().await;
+    rt.shutdown(DEADLINE).await.unwrap();
 
     // No runtime runs when the alarm comes due.
     tokio::time::sleep(MS(200)).await;
-    open(&dir, &FAILURES).unwrap().shutdown().await;
+    open(&dir, &FAILURES)
+        .unwrap()
+        .shutdown(DEADLINE)
+        .await
+        .unwrap();
     tokio::time::sleep(MS(300)).await;
 
     let rt = open(&dir, &FAILURES).unwrap();

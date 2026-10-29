@@ -80,9 +80,16 @@ cargo run --example stock
 - `Runtime::open` must run inside a Tokio runtime.
 - One runtime owns its data directory. A second runtime on the same directory
   fails with `Error::Locked`, also from another process.
-- `Runtime::shutdown` runs the calls that wait, then releases the lock. After
-  it, a call fails with `Error::Closed`. If the runtime drops with no
-  shutdown, the lock stays until the last instance stops.
+- `Runtime::shutdown(deadline)` runs the calls that wait until `deadline`.
+  Then it aborts each turn in `handle` or `alarm`; that turn does not commit,
+  and its caller gets `Error::Stopped`. A turn in its commit is not aborted.
+  A call that did not begin gets `Error::Closed`. An aborted alarm stays set.
+- The abort takes effect at the next `await` of a turn. A turn with no
+  `await` cannot be stopped.
+- After the abort, shutdown waits 1 s more. It releases the lock only when no
+  instance runs; else it returns `Error::Deadline` with `running` above 0 and
+  keeps the lock. If the runtime drops with no shutdown, the lock stays until
+  the last instance stops.
 
 ## Storage
 

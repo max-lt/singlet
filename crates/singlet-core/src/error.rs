@@ -24,13 +24,25 @@ pub enum Error {
     #[error("too many calls wait for this key")]
     Overloaded,
 
-    /// The runtime is shut down. The call did not run.
+    /// The call did not begin, because the runtime is shut down.
     #[error("runtime is shut down")]
     Closed,
 
-    /// The instance panicked during the turn. The turn did not commit.
+    /// The call began and did not commit. The instance panicked, or a
+    /// shutdown aborted the turn.
     #[error("instance stopped before it replied")]
     Stopped,
+
+    /// From [`Runtime::shutdown`](crate::Runtime::shutdown) after its
+    /// deadline.
+    #[error("shutdown aborted {aborted} turns, {running} instances still run")]
+    Deadline {
+        /// The turns that the shutdown aborted. They did not commit.
+        aborted: usize,
+        /// The instances that still run. While this is above 0, the runtime
+        /// keeps the lock of its data directory.
+        running: usize,
+    },
 
     /// From [`Actor::handle`](crate::Actor::handle) or
     /// [`Actor::alarm`](crate::Actor::alarm). The turn did not commit. The

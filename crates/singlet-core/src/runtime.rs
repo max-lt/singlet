@@ -7,11 +7,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::Actor;
@@ -24,6 +28,7 @@ use crate::alarm::Index;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INDEX_RETRY: Duration = Duration::from_secs(1);
+const ABORT_WAIT: Duration = Duration::from_secs(1);
 
 /// Routes calls to one instance per key, and wakes instances for their
 /// alarms.
@@ -60,10 +65,30 @@ struct Inner<A: Actor> {
     make: Make<A>,
     registry: Mutex<Registry<A>>,
     index: Arc<Index>,
-    // Ends when every instance has stopped after a shutdown.
-    stopped: Mutex<Option<mpsc::Receiver<()>>>,
+    // The instances whose task has not ended.
+    live: watch::Sender<usize>,
+    // The turns that a shutdown aborted.
+    aborted: AtomicUsize,
     scheduler: Mutex<Option<JoinHandle<()>>>,
     lock: Mutex<Option<File>>,
+    #[cfg(test)]
+    gate: Mutex<Option<Arc<Gate>>>,
+}
+
+impl<A: Actor> Inner<A> {
+    /// Gives the reply of a turn. An aborted turn gets no reply, so its
+    /// caller gets [`Error::Stopped`].
+    fn reply<T>(&self, result: Result<T, TurnError>) -> Option<Result<T, Error>> {
+        match result {
+            Ok(value) => Some(Ok(value)),
+            Err(TurnError::Failed(e)) => Some(Err(e)),
+            Err(TurnError::Aborted) => {
+                self.aborted.fetch_add(1, SeqCst);
+
+                None
+            }
+        }
+    }
 }
 
 impl<A: Actor> Drop for Inner<A> {
@@ -75,9 +100,9 @@ impl<A: Actor> Drop for Inner<A> {
 
 struct Registry<A: Actor> {
     entries: HashMap<A::Key, Entry<A>>,
+    controls: HashMap<u64, Arc<Control>>,
     next_id: u64,
-    // Each instance holds a clone. None after a shutdown.
-    alive: Option<mpsc::Sender<()>>,
+    closed: bool,
 }
 
 struct Entry<A: Actor> {
@@ -100,6 +125,131 @@ enum OnFailure {
 enum Response<A: Actor> {
     Done(Result<A::Reply, Error>),
     Retry(A::Msg),
+}
+
+enum TurnError {
+    Aborted,
+    Failed(Error),
+}
+
+impl From<Error> for TurnError {
+    fn from(e: Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    Idle,
+    Turn,
+    Commit,
+}
+
+struct State {
+    phase: Phase,
+    stop: bool,
+}
+
+/// Lets a shutdown abort the turn of an instance, but not its commit.
+struct Control {
+    state: Mutex<State>,
+    cancel: Notify,
+    #[cfg(test)]
+    gate: Option<Arc<Gate>>,
+}
+
+impl Control {
+    /// Starts a turn. Returns false if a shutdown stops the instance.
+    fn begin(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+
+        if state.stop {
+            return false;
+        }
+
+        state.phase = Phase::Turn;
+
+        true
+    }
+
+    fn end(&self) {
+        self.state.lock().unwrap().phase = Phase::Idle;
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stop = true;
+
+        if state.phase == Phase::Turn {
+            self.cancel.notify_one();
+        }
+    }
+
+    /// Fails if a shutdown came during a commit of this turn.
+    fn check(&self) -> Result<(), TurnError> {
+        if self.state.lock().unwrap().stop {
+            return Err(TurnError::Aborted);
+        }
+
+        Ok(())
+    }
+
+    /// Runs the code of the actor until it completes or a shutdown aborts
+    /// it. The abort drops the future at its next `await`.
+    async fn run<F: Future>(&self, code: F) -> Result<F::Output, TurnError> {
+        tokio::select! {
+            output = code => Ok(output),
+            () = self.cancel.notified() => Err(TurnError::Aborted),
+        }
+    }
+
+    async fn commit(&self, ctx: &mut Ctx) -> Result<(), TurnError> {
+        #[cfg(test)]
+        self.pass(Point::BeforeCommit).await;
+
+        // One step under the lock: a shutdown aborts the turn here, or it
+        // waits for the commit.
+        {
+            let mut state = self.state.lock().unwrap();
+
+            if state.stop {
+                return Err(TurnError::Aborted);
+            }
+
+            state.phase = Phase::Commit;
+        }
+
+        #[cfg(test)]
+        self.pass(Point::InCommit).await;
+
+        let result = ctx.commit().await;
+        self.state.lock().unwrap().phase = Phase::Turn;
+
+        Ok(result?)
+    }
+
+    #[cfg(test)]
+    async fn pass(&self, at: Point) {
+        if let Some(gate) = self.gate.as_ref().filter(|gate| gate.at == at) {
+            gate.reached.notify_one();
+            gate.open.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum Point {
+    BeforeCommit,
+    InCommit,
+}
+
+/// Holds an instance at a point of its commit, for the tests.
+#[cfg(test)]
+struct Gate {
+    at: Point,
+    reached: Notify,
+    open: Notify,
 }
 
 impl<A: Actor> Runtime<A> {
@@ -126,7 +276,6 @@ impl<A: Actor> Runtime<A> {
         }
 
         let index = Arc::new(Index::open(&dir.join("alarms.sqlite"))?);
-        let (alive, stopped) = mpsc::channel(1);
 
         let inner = Arc::new(Inner {
             objects,
@@ -134,13 +283,17 @@ impl<A: Actor> Runtime<A> {
             make: Box::new(make),
             registry: Mutex::new(Registry {
                 entries: HashMap::new(),
+                controls: HashMap::new(),
                 next_id: 0,
-                alive: Some(alive),
+                closed: false,
             }),
             index: index.clone(),
-            stopped: Mutex::new(Some(stopped)),
+            live: watch::Sender::new(0),
+            aborted: AtomicUsize::new(0),
             scheduler: Mutex::default(),
             lock: Mutex::new(Some(lock)),
+            #[cfg(test)]
+            gate: Mutex::default(),
         });
 
         let scheduler = tokio::spawn(schedule(Arc::downgrade(&inner), index));
@@ -173,32 +326,67 @@ impl<A: Actor> Runtime<A> {
     /// Stops the runtime and releases the lock of its data directory.
     ///
     /// New calls fail with [`Error::Closed`], also through the clones of this
-    /// runtime. The calls that wait still run. The alarms stay in storage for
-    /// the next runtime.
-    pub async fn shutdown(&self) {
-        let stopped = {
+    /// runtime. The calls that wait run until `deadline`. After `deadline`:
+    ///
+    /// - A turn in [`Actor::handle`] or [`Actor::alarm`] is aborted. Its
+    ///   writes do not commit, and its caller gets [`Error::Stopped`].
+    /// - A turn in its commit is not aborted. It commits, and its caller gets
+    ///   the reply.
+    /// - A call that did not begin gets [`Error::Closed`].
+    /// - An aborted alarm stays set, and the abort does not count as a try.
+    ///
+    /// The abort takes effect at the next `await` of the turn. A turn that
+    /// runs with no `await` cannot be stopped.
+    ///
+    /// After the abort, shutdown waits 1 s more for the instances to stop.
+    /// It releases the lock only when no instance runs, so a second runtime
+    /// cannot open a file that an old instance can still write. A call to
+    /// shutdown again waits again.
+    ///
+    /// Returns [`Error::Deadline`] if it aborted a turn or if an instance
+    /// still runs.
+    pub async fn shutdown(&self, deadline: Duration) -> Result<(), Error> {
+        {
             let mut registry = self.inner.registry.lock().unwrap();
+            registry.closed = true;
             registry.entries.clear();
-            registry.alive = None;
-
-            self.inner.stopped.lock().unwrap().take()
-        };
+        }
 
         self.inner.index.wake.notify_one();
 
-        let Some(mut stopped) = stopped else {
-            return;
-        };
+        let mut live = self.inner.live.subscribe();
+        let stopped = tokio::time::timeout(deadline, live.wait_for(|n| *n == 0))
+            .await
+            .is_ok();
 
-        stopped.recv().await;
+        if !stopped {
+            for control in self.inner.registry.lock().unwrap().controls.values() {
+                control.stop();
+            }
 
-        let scheduler = self.inner.scheduler.lock().unwrap().take();
-
-        if let Some(scheduler) = scheduler {
-            scheduler.await.ok();
+            tokio::time::timeout(ABORT_WAIT, live.wait_for(|n| *n == 0))
+                .await
+                .ok();
         }
 
-        self.inner.lock.lock().unwrap().take();
+        let running = *live.borrow();
+        let aborted = self.inner.aborted.load(SeqCst);
+
+        if running == 0 {
+            let scheduler = self.inner.scheduler.lock().unwrap().take();
+
+            if let Some(scheduler) = scheduler {
+                scheduler.await.ok();
+            }
+
+            self.inner.lock.lock().unwrap().take();
+        }
+
+        if aborted == 0 && running == 0 {
+            return Ok(());
+        }
+
+        Err(Error::Deadline { aborted, running })
     }
 
     async fn alarm(&self, key: &A::Key, on_failure: OnFailure) -> Result<(), Error> {
@@ -227,9 +415,9 @@ impl<A: Actor> Runtime<A> {
             };
         }
 
-        let Some(alive) = registry.alive.clone() else {
+        if registry.closed {
             return Err(Error::Closed);
-        };
+        }
 
         let id = registry.next_id;
         registry.next_id += 1;
@@ -239,12 +427,24 @@ impl<A: Actor> Runtime<A> {
         let key = key.to_owned();
         registry.entries.insert(key.clone(), Entry { id, tx });
 
+        let control = Arc::new(Control {
+            state: Mutex::new(State {
+                phase: Phase::Idle,
+                stop: false,
+            }),
+            cancel: Notify::new(),
+            #[cfg(test)]
+            gate: self.inner.gate.lock().unwrap().clone(),
+        });
+        registry.controls.insert(id, control.clone());
+        self.inner.live.send_modify(|n| *n += 1);
+
         let mailbox = Mailbox {
             key,
             id,
             rx,
+            control,
             inner: self.inner.clone(),
-            _alive: alive,
         };
 
         tokio::spawn(run(mailbox));
@@ -260,8 +460,8 @@ struct Mailbox<A: Actor> {
     key: A::Key,
     id: u64,
     rx: mpsc::Receiver<Job<A>>,
+    control: Arc<Control>,
     inner: Arc<Inner<A>>,
-    _alive: mpsc::Sender<()>,
 }
 
 impl<A: Actor> Mailbox<A> {
@@ -293,6 +493,7 @@ impl<A: Actor> Drop for Mailbox<A> {
     fn drop(&mut self) {
         let mut registry = self.inner.registry.lock().unwrap();
         self.remove_entry(&mut registry);
+        registry.controls.remove(&self.id);
         drop(registry);
 
         while let Ok(job) = self.rx.try_recv() {
@@ -300,6 +501,8 @@ impl<A: Actor> Drop for Mailbox<A> {
                 reply.send(Response::Retry(msg)).ok();
             }
         }
+
+        self.inner.live.send_modify(|n| *n -= 1);
     }
 }
 
@@ -311,6 +514,7 @@ async fn run<A: Actor>(mut mailbox: Mailbox<A>) {
 
 async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
     let inner = mailbox.inner.clone();
+    let control = mailbox.control.clone();
 
     let mut ctx = match Ctx::open(&inner.objects, mailbox.key.encode(), inner.index.clone()) {
         Ok(ctx) => ctx,
@@ -335,27 +539,41 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
             Err(_) => continue,
         };
 
+        if !control.begin() {
+            match job {
+                // The call did not begin, so the caller sends it again and
+                // gets Error::Closed.
+                Job::Call(msg, reply) => reply.send(Response::Retry(msg)).ok(),
+                Job::Alarm(_, done) => done.send(Err(Error::Closed)).ok(),
+            };
+
+            return;
+        }
+
         let failed = match job {
             Job::Call(msg, reply) => {
-                let result = match actor.handle(&mut ctx, msg).await {
-                    Ok(value) => ctx.commit().await.map(|()| value),
-                    Err(e) => Err(e),
-                };
-
+                let result = call_turn(&mut actor, &mut ctx, &control, msg).await;
                 let failed = result.is_err();
-                reply.send(Response::Done(result)).ok();
+
+                if let Some(result) = inner.reply(result) {
+                    reply.send(Response::Done(result)).ok();
+                }
 
                 failed
             }
             Job::Alarm(on_failure, done) => {
-                let result = alarm_turn(&mut actor, &mut ctx, on_failure).await;
-
+                let result = alarm_turn(&mut actor, &mut ctx, &control, on_failure).await;
                 let failed = result.is_err();
-                done.send(result).ok();
+
+                if let Some(result) = inner.reply(result) {
+                    done.send(result).ok();
+                }
 
                 failed
             }
         };
+
+        control.end();
 
         if failed {
             return;
@@ -363,26 +581,55 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
     }
 }
 
+async fn call_turn<A: Actor>(
+    actor: &mut A,
+    ctx: &mut Ctx,
+    control: &Control,
+    msg: A::Msg,
+) -> Result<A::Reply, TurnError> {
+    let value = control.run(actor.handle(ctx, msg)).await??;
+    control.commit(ctx).await?;
+
+    Ok(value)
+}
+
 async fn alarm_turn<A: Actor>(
     actor: &mut A,
     ctx: &mut Ctx,
+    control: &Control,
     on_failure: OnFailure,
-) -> Result<(), Error> {
+) -> Result<(), TurnError> {
     // The index wakes an object early, never late; the file decides.
-    if ctx.alarm_ms()?.is_none_or(|at| at > alarm::now_ms()) {
-        return ctx.sync_index();
-    }
+    let Some(at) = ctx.alarm_ms()?.filter(|&at| at <= alarm::now_ms()) else {
+        return Ok(ctx.sync_index()?);
+    };
 
     ctx.delete_alarm()?;
 
+    if on_failure == OnFailure::Retry {
+        control.run(actor.alarm(ctx)).await??;
+
+        return control.commit(ctx).await;
+    }
+
     // The last try commits the delete first, so its failure drops the alarm.
-    if on_failure == OnFailure::Drop {
+    control.commit(ctx).await?;
+
+    let result = async {
+        control.check()?;
+        control.run(actor.alarm(ctx)).await??;
+        control.commit(ctx).await
+    }
+    .await;
+
+    // An abort is not a failure of the alarm, so the alarm goes back.
+    if let Err(TurnError::Aborted) = result {
+        ctx.rollback()?;
+        ctx.set_alarm(alarm::from_ms(at))?;
         ctx.commit().await?;
     }
 
-    actor.alarm(ctx).await?;
-
-    ctx.commit().await
+    result
 }
 
 // Holds the runtime only while it reads the index, so a dropped runtime can
@@ -396,7 +643,7 @@ async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
                 return;
             };
 
-            if strong.registry.lock().unwrap().alive.is_none() {
+            if strong.registry.lock().unwrap().closed {
                 return;
             }
 
@@ -461,10 +708,15 @@ async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8
             OnFailure::Drop
         };
 
-        match (Runtime { inner }).alarm(&decoded, on_failure).await {
-            Ok(()) | Err(Error::Closed) => break,
-            Err(_) if on_failure == OnFailure::Drop => break,
-            Err(_) => {}
+        let rt = Runtime { inner };
+        let result = rt.alarm(&decoded, on_failure).await;
+
+        // A shutdown is not a failure of the alarm.
+        if result.is_ok()
+            || on_failure == OnFailure::Drop
+            || rt.inner.registry.lock().unwrap().closed
+        {
+            break;
         }
 
         let backoff = alarm_backoff.saturating_mul(1 << failures.min(16));

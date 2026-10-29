@@ -22,6 +22,7 @@ const KEYS: u64 = 4;
 const IDLE: Duration = Duration::from_millis(2);
 const MAX_BURST: u8 = 16;
 const ALARM_DEADLINE: Duration = Duration::from_secs(10);
+const DEADLINE: Duration = Duration::from_secs(10);
 
 static TOKIO: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -173,13 +174,13 @@ async fn check(ops: Vec<Op>) {
                 tokio::time::sleep(Duration::from_millis(u64::from(ms % 5))).await;
             }
             Op::Restart => {
-                rt.shutdown().await;
+                rt.shutdown(DEADLINE).await.unwrap();
                 rt = open(dir.path()).unwrap();
             }
         }
     }
 
-    rt.shutdown().await;
+    rt.shutdown(DEADLINE).await.unwrap();
     let rt = open(dir.path()).unwrap();
 
     let deadline = Instant::now() + ALARM_DEADLINE;

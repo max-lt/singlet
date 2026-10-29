@@ -10,6 +10,7 @@ use singlet_core::Runtime;
 use tokio::sync::oneshot;
 
 const IDLE: Duration = Duration::from_millis(50);
+const DEADLINE: Duration = Duration::from_secs(5);
 
 enum Cmd {
     Inc,
@@ -166,7 +167,7 @@ async fn storage_outlives_the_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let rt = open(&dir);
     rt.call("room", Cmd::Inc).await.unwrap();
-    rt.shutdown().await;
+    rt.shutdown(DEADLINE).await.unwrap();
 
     let rt = open(&dir);
     assert_eq!(rt.call("room", Cmd::Inc).await.unwrap(), count(2, 1));
@@ -297,7 +298,7 @@ async fn shutdown_runs_the_waiting_calls_and_releases_the_lock() {
     }
 
     release.send(()).unwrap();
-    rt.shutdown().await;
+    rt.shutdown(DEADLINE).await.unwrap();
 
     for (call, n) in waiting.iter_mut().zip(1..) {
         let Poll::Ready(reply) = poll_once(call.as_mut()).await else {

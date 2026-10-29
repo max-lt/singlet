@@ -135,6 +135,19 @@ impl Ctx {
         self.index.set(&self.key, self.alarm_ms()?)
     }
 
+    /// Discards the writes of the turn.
+    pub(crate) fn rollback(&mut self) -> Result<(), Error> {
+        if !self.writing {
+            return Ok(());
+        }
+
+        self.writing = false;
+        self.alarm = None;
+        self.conn().execute_batch("ROLLBACK")?;
+
+        Ok(())
+    }
+
     fn begin(&mut self) -> Result<(), Error> {
         if self.writing {
             return Ok(());
