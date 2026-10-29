@@ -86,7 +86,6 @@ then checks its file and does nothing.
 ## Limits
 
 - One node. There is no replication.
-- A commit runs on the async thread of the instance.
 - An `await` in `handle` blocks all calls for its key.
 
 ## Fuzzing

@@ -265,7 +265,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
         let failed = match job {
             Job::Call(msg, reply) => {
                 let result = match actor.handle(&mut ctx, msg).await {
-                    Ok(value) => ctx.commit().map(|()| value),
+                    Ok(value) => ctx.commit().await.map(|()| value),
                     Err(e) => Err(e),
                 };
 
@@ -299,7 +299,7 @@ async fn alarm_turn<A: Actor>(actor: &mut A, ctx: &mut Ctx) -> Result<(), Error>
     ctx.delete_alarm()?;
     actor.alarm(ctx).await?;
 
-    ctx.commit()
+    ctx.commit().await
 }
 
 // Holds the runtime only while it reads the index, so a dropped runtime can

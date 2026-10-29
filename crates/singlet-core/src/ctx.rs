@@ -16,7 +16,8 @@ use crate::alarm::Index;
 /// Reads see the writes of the current turn. The runtime commits or discards
 /// these writes at the end of the turn.
 pub struct Ctx {
-    conn: Connection,
+    // None only while a commit runs on a blocking thread.
+    conn: Option<Connection>,
     key: Vec<u8>,
     index: Arc<Index>,
     writing: bool,
@@ -39,7 +40,7 @@ impl Ctx {
         )?;
 
         Ok(Self {
-            conn,
+            conn: Some(conn),
             key,
             index,
             writing: false,
@@ -47,9 +48,13 @@ impl Ctx {
         })
     }
 
+    fn conn(&self) -> &Connection {
+        self.conn.as_ref().expect("commit puts the connection back")
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
         let value = self
-            .conn
+            .conn()
             .prepare_cached("SELECT value FROM kv WHERE key = ?1")?
             .query_row([key], |row| row.get(0))
             .optional()?;
@@ -59,7 +64,7 @@ impl Ctx {
 
     pub fn put(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
         self.begin()?;
-        self.conn
+        self.conn()
             .prepare_cached("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")?
             .execute((key, value))?;
 
@@ -68,7 +73,7 @@ impl Ctx {
 
     pub fn delete(&mut self, key: &str) -> Result<(), Error> {
         self.begin()?;
-        self.conn
+        self.conn()
             .prepare_cached("DELETE FROM kv WHERE key = ?1")?
             .execute([key])?;
 
@@ -87,7 +92,7 @@ impl Ctx {
         let at = alarm::to_ms(at);
 
         self.begin()?;
-        self.conn
+        self.conn()
             .prepare_cached("INSERT OR REPLACE INTO alarm (id, at) VALUES (0, ?1)")?
             .execute([at])?;
         self.alarm = Some(Some(at));
@@ -97,7 +102,9 @@ impl Ctx {
 
     pub fn delete_alarm(&mut self) -> Result<(), Error> {
         self.begin()?;
-        self.conn.prepare_cached("DELETE FROM alarm")?.execute([])?;
+        self.conn()
+            .prepare_cached("DELETE FROM alarm")?
+            .execute([])?;
         self.alarm = Some(None);
 
         Ok(())
@@ -105,7 +112,7 @@ impl Ctx {
 
     pub(crate) fn alarm_ms(&self) -> Result<Option<i64>, Error> {
         let at = self
-            .conn
+            .conn()
             .prepare_cached("SELECT at FROM alarm WHERE id = 0")?
             .query_row([], |row| row.get(0))
             .optional()?;
@@ -123,33 +130,56 @@ impl Ctx {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn().execute_batch("BEGIN IMMEDIATE")?;
         self.writing = true;
 
         Ok(())
     }
 
-    /// Waits for fsync on the calling thread.
-    pub(crate) fn commit(&mut self) -> Result<(), Error> {
+    /// Runs on a blocking thread, as it waits for fsync.
+    pub(crate) async fn commit(&mut self) -> Result<(), Error> {
         if !self.writing {
             return Ok(());
         }
 
         self.writing = false;
+
+        let conn = self.conn.take().expect("commit puts the connection back");
+        let index = self.index.clone();
+        let key = self.key.clone();
         let alarm = self.alarm.take();
 
-        if let Some(Some(at)) = alarm {
-            self.index.lower(&self.key, at)?;
-        }
+        let (conn, result) = tokio::task::spawn_blocking(move || {
+            let result = commit(&conn, &index, &key, alarm);
 
-        self.conn.execute_batch("COMMIT")?;
+            (conn, result)
+        })
+        .await
+        .expect("commit does not panic");
 
-        // On failure the entry stays early or stale, never late, and the
-        // next wake corrects it.
-        if let Some(at) = alarm {
-            self.index.set(&self.key, at).ok();
-        }
+        self.conn = Some(conn);
 
-        Ok(())
+        result
     }
+}
+
+fn commit(
+    conn: &Connection,
+    index: &Index,
+    key: &[u8],
+    alarm: Option<Option<i64>>,
+) -> Result<(), Error> {
+    if let Some(Some(at)) = alarm {
+        index.lower(key, at)?;
+    }
+
+    conn.execute_batch("COMMIT")?;
+
+    // On failure the entry stays early or stale, never late, and the next
+    // wake corrects it.
+    if let Some(at) = alarm {
+        index.set(key, at).ok();
+    }
+
+    Ok(())
 }
