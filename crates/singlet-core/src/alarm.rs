@@ -23,6 +23,9 @@ pub(crate) struct Index {
     // The next reads of the index fail while this is above zero.
     #[cfg(test)]
     pub(crate) fail_reads: std::sync::atomic::AtomicU32,
+    // The next commits of the objects fail while this is above zero.
+    #[cfg(test)]
+    pub(crate) fail_commits: std::sync::atomic::AtomicU32,
 }
 
 impl Index {
@@ -39,6 +42,8 @@ impl Index {
             wake: Notify::new(),
             #[cfg(test)]
             fail_reads: Default::default(),
+            #[cfg(test)]
+            fail_commits: Default::default(),
         })
     }
 
@@ -81,7 +86,11 @@ impl Index {
     /// as delivering.
     pub(crate) fn take_due(&self, now: i64) -> Result<Vec<Vec<u8>>, Error> {
         #[cfg(test)]
-        self.fail_read()?;
+        if take(&self.fail_reads) {
+            let io = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR);
+
+            return Err(Error::Storage(rusqlite::Error::SqliteFailure(io, None)));
+        }
 
         let due: Vec<Vec<u8>> = self
             .conn
@@ -114,23 +123,16 @@ impl Index {
         self.delivering.lock().unwrap().remove(key);
         self.wake.notify_one();
     }
+}
 
-    #[cfg(test)]
-    fn fail_read(&self) -> Result<(), Error> {
-        use std::sync::atomic::Ordering::SeqCst;
+/// Takes one from `counter` if it is above zero.
+#[cfg(test)]
+pub(crate) fn take(counter: &std::sync::atomic::AtomicU32) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
 
-        if self
-            .fail_reads
-            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        let io = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR);
-
-        Err(Error::Storage(rusqlite::Error::SqliteFailure(io, None)))
-    }
+    counter
+        .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 pub(crate) fn to_ms(at: SystemTime) -> i64 {

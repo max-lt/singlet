@@ -204,7 +204,13 @@ fn commit(
         index.lower(key, at)?;
     }
 
-    conn.execute_batch("COMMIT")?;
+    // A COMMIT with no transaction fails, as a commit that fails does.
+    #[cfg(test)]
+    if alarm::take(&index.fail_commits) {
+        conn.execute_batch("ROLLBACK")?;
+    }
+
+    conn.execute_batch("COMMIT").map_err(Error::Commit)?;
 
     // On failure the entry stays early or stale, never late, and the next
     // wake corrects it.

@@ -63,7 +63,9 @@ cargo run --example stock
 - The writes of a turn commit when `handle` or `alarm` returns `Ok`, before
   the caller gets the reply.
 - An error from `call` means that the turn did not commit, so the caller can
-  send the call again.
+  send the call again. The exception is `Error::Commit`: the commit failed,
+  for example on fsync, and its writes can be on disk. Send that call again
+  only if it is safe to apply it two times.
 - A turn that returns `Err` discards its writes and the instance. The next
   call starts a new instance from storage.
 - `ctx.set_alarm(at)` sets the one alarm of an instance. At `at`, the

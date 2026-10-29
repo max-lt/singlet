@@ -184,7 +184,8 @@ impl<A: Actor> Runtime<A> {
     /// Sends `msg` to the instance of `key` and waits for its reply.
     ///
     /// An error means that the turn did not commit, so the call can be sent
-    /// again. A call from [`Actor::handle`] to its own key waits for ever.
+    /// again, except [`Error::Commit`]. A call from [`Actor::handle`] to its
+    /// own key waits for ever.
     pub async fn call<Q>(&self, key: &Q, mut msg: A::Msg) -> Result<A::Reply, Error>
     where
         A::Key: Borrow<Q>,

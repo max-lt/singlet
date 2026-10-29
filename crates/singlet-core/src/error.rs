@@ -1,7 +1,7 @@
 /// An error of the runtime or of an instance.
 ///
 /// An error from [`Runtime::call`](crate::Runtime::call) means that the turn
-/// did not commit.
+/// did not commit, except [`Error::Commit`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A SQLite operation failed.
@@ -19,6 +19,12 @@ pub enum Error {
     /// A storage file has a format version that this crate does not read.
     #[error("storage format {0} is not supported")]
     Format(i64),
+
+    /// The commit of the turn failed, and the turn may have committed: after
+    /// a failed fsync, its writes can be on disk. Send the call again only if
+    /// it is safe to apply it two times.
+    #[error("commit failed, and the turn may have committed")]
+    Commit(#[source] rusqlite::Error),
 
     /// The mailbox of the key is full. The call did not run.
     #[error("too many calls wait for this key")]

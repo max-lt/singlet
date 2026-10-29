@@ -207,6 +207,21 @@ async fn shutdown_stops_a_scheduler_that_waits_to_retry() {
     );
 }
 
+#[tokio::test]
+async fn a_failed_commit_gives_error_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = open(&dir);
+    rt.inner.index.fail_commits.store(1, SeqCst);
+
+    assert!(matches!(
+        rt.call("a", Cmd::Inc).await,
+        Err(Error::Commit(_))
+    ));
+
+    // The hook rolls back before the COMMIT, so the first write is not kept.
+    assert_eq!(rt.call("a", Cmd::Inc).await.unwrap(), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_shutdown_with_no_hung_turn_returns_at_once() {
     let dir = tempfile::tempdir().unwrap();
