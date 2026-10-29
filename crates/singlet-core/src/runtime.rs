@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
@@ -112,7 +113,7 @@ struct Entry<A: Actor> {
 
 enum Job<A: Actor> {
     Call(A::Msg, oneshot::Sender<Response<A>>),
-    // A dropped sender means the alarm did not run.
+    // A dropped sender means the turn did not commit.
     Alarm(OnFailure, oneshot::Sender<Result<(), Error>>),
 }
 
@@ -138,60 +139,23 @@ impl From<Error> for TurnError {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Phase {
-    Idle,
-    Turn,
-    Commit,
-}
-
-struct State {
-    phase: Phase,
-    stop: bool,
-}
-
 /// Lets a shutdown abort the turn of an instance, but not its commit.
 struct Control {
-    state: Mutex<State>,
+    stop: AtomicBool,
+    // Holds its permit, so a turn that starts after the stop is aborted.
     cancel: Notify,
     #[cfg(test)]
     gate: Option<Arc<Gate>>,
 }
 
 impl Control {
-    /// Starts a turn. Returns false if a shutdown stops the instance.
-    fn begin(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-
-        if state.stop {
-            return false;
-        }
-
-        state.phase = Phase::Turn;
-
-        true
-    }
-
-    fn end(&self) {
-        self.state.lock().unwrap().phase = Phase::Idle;
+    fn stopped(&self) -> bool {
+        self.stop.load(SeqCst)
     }
 
     fn stop(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.stop = true;
-
-        if state.phase == Phase::Turn {
-            self.cancel.notify_one();
-        }
-    }
-
-    /// Fails if a shutdown came during a commit of this turn.
-    fn check(&self) -> Result<(), TurnError> {
-        if self.state.lock().unwrap().stop {
-            return Err(TurnError::Aborted);
-        }
-
-        Ok(())
+        self.stop.store(true, SeqCst);
+        self.cancel.notify_one();
     }
 
     /// Runs the code of the actor until it completes or a shutdown aborts
@@ -207,25 +171,16 @@ impl Control {
         #[cfg(test)]
         self.pass(Point::BeforeCommit).await;
 
-        // One step under the lock: a shutdown aborts the turn here, or it
-        // waits for the commit.
-        {
-            let mut state = self.state.lock().unwrap();
-
-            if state.stop {
-                return Err(TurnError::Aborted);
-            }
-
-            state.phase = Phase::Commit;
+        // A stop after this read waits for the commit; the commit is not in
+        // run, so the cancel cannot reach it.
+        if self.stopped() {
+            return Err(TurnError::Aborted);
         }
 
         #[cfg(test)]
         self.pass(Point::InCommit).await;
 
-        let result = ctx.commit().await;
-        self.state.lock().unwrap().phase = Phase::Turn;
-
-        Ok(result?)
+        Ok(ctx.commit().await?)
     }
 
     #[cfg(test)]
@@ -355,11 +310,11 @@ impl<A: Actor> Runtime<A> {
         self.inner.index.wake.notify_one();
 
         let mut live = self.inner.live.subscribe();
-        let stopped = tokio::time::timeout(deadline, live.wait_for(|n| *n == 0))
-            .await
-            .is_ok();
 
-        if !stopped {
+        if tokio::time::timeout(deadline, live.wait_for(|n| *n == 0))
+            .await
+            .is_err()
+        {
             for control in self.inner.registry.lock().unwrap().controls.values() {
                 control.stop();
             }
@@ -428,10 +383,7 @@ impl<A: Actor> Runtime<A> {
         registry.entries.insert(key.clone(), Entry { id, tx });
 
         let control = Arc::new(Control {
-            state: Mutex::new(State {
-                phase: Phase::Idle,
-                stop: false,
-            }),
+            stop: AtomicBool::new(false),
             cancel: Notify::new(),
             #[cfg(test)]
             gate: self.inner.gate.lock().unwrap().clone(),
@@ -539,7 +491,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
             Err(_) => continue,
         };
 
-        if !control.begin() {
+        if control.stopped() {
             match job {
                 // The call did not begin, so the caller sends it again and
                 // gets Error::Closed.
@@ -573,8 +525,6 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
             }
         };
 
-        control.end();
-
         if failed {
             return;
         }
@@ -606,24 +556,19 @@ async fn alarm_turn<A: Actor>(
 
     ctx.delete_alarm()?;
 
-    if on_failure == OnFailure::Retry {
-        control.run(actor.alarm(ctx)).await??;
-
-        return control.commit(ctx).await;
+    // The last try commits the delete first, so its failure drops the alarm.
+    if on_failure == OnFailure::Drop {
+        control.commit(ctx).await?;
     }
 
-    // The last try commits the delete first, so its failure drops the alarm.
-    control.commit(ctx).await?;
-
     let result = async {
-        control.check()?;
         control.run(actor.alarm(ctx)).await??;
         control.commit(ctx).await
     }
     .await;
 
-    // An abort is not a failure of the alarm, so the alarm goes back.
-    if let Err(TurnError::Aborted) = result {
+    // An abort is not a failure, so the last try sets the alarm again.
+    if on_failure == OnFailure::Drop && matches!(result, Err(TurnError::Aborted)) {
         ctx.rollback()?;
         ctx.set_alarm(alarm::from_ms(at))?;
         ctx.commit().await?;
