@@ -13,11 +13,13 @@ use std::time::Duration;
 
 use singlet_core::{Actor, Ctx, Error, Runtime};
 
-#[derive(Default)]
 struct Counter;
 
 impl Actor for Counter {
-    async fn handle(&mut self, ctx: &mut Ctx, _msg: Vec<u8>) -> Result<Vec<u8>, Error> {
+    type Msg = ();
+    type Reply = u64;
+
+    async fn handle(&mut self, ctx: &mut Ctx, _: ()) -> Result<u64, Error> {
         let n = match ctx.get("n")? {
             Some(v) => u64::from_le_bytes(v.try_into().unwrap()),
             None => 0,
@@ -25,12 +27,12 @@ impl Actor for Counter {
 
         ctx.put("n", &(n + 1).to_le_bytes())?;
 
-        Ok((n + 1).to_le_bytes().to_vec())
+        Ok(n + 1)
     }
 }
 
 let rt = Runtime::open("data", Duration::from_secs(60), |_key| Counter)?;
-let reply = rt.call("room-1", vec![]).await?;
+let n = rt.call("room-1", ()).await?;
 ```
 
 ## Examples
@@ -47,6 +49,7 @@ cargo run --example stock
 
 - A runtime starts the instance of a key on the first call. It stops the
   instance after the idle time with no calls.
+- `Msg` and `Reply` move in memory; there is no serialization.
 - One call to `handle` is a turn. Calls for one key do not interleave, also
   across an `await`. Calls for different keys run in parallel.
 - The writes of a turn commit when `handle` returns `Ok`, before the caller

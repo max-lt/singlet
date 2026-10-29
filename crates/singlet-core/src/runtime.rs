@@ -17,11 +17,11 @@ use crate::Error;
 ///
 /// One runtime owns its data directory; a second `open` on the same
 /// directory fails with [`Error::Locked`], even from another process.
-pub struct Runtime<A> {
+pub struct Runtime<A: Actor> {
     inner: Arc<Inner<A>>,
 }
 
-impl<A> Clone for Runtime<A> {
+impl<A: Actor> Clone for Runtime<A> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -29,33 +29,32 @@ impl<A> Clone for Runtime<A> {
     }
 }
 
-struct Inner<A> {
+struct Inner<A: Actor> {
     objects: PathBuf,
     idle: Duration,
     make: Box<dyn Fn(&str) -> A + Send + Sync>,
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Mutex<Registry<A>>>,
     _lock: File,
 }
 
-#[derive(Default)]
-struct Registry {
-    entries: HashMap<String, Entry>,
+struct Registry<A: Actor> {
+    entries: HashMap<String, Entry<A>>,
     next_id: u64,
 }
 
-struct Entry {
+struct Entry<A: Actor> {
     id: u64,
-    tx: mpsc::UnboundedSender<Envelope>,
+    tx: mpsc::UnboundedSender<Envelope<A>>,
 }
 
-struct Envelope {
-    msg: Vec<u8>,
-    reply: oneshot::Sender<Reply>,
+struct Envelope<A: Actor> {
+    msg: A::Msg,
+    reply: oneshot::Sender<Response<A>>,
 }
 
-enum Reply {
-    Done(Result<Vec<u8>, Error>),
-    Retry(Vec<u8>),
+enum Response<A: Actor> {
+    Done(Result<A::Reply, Error>),
+    Retry(A::Msg),
 }
 
 impl<A: Actor> Runtime<A> {
@@ -83,21 +82,24 @@ impl<A: Actor> Runtime<A> {
                 objects,
                 idle,
                 make: Box::new(make),
-                registry: Arc::default(),
+                registry: Arc::new(Mutex::new(Registry {
+                    entries: HashMap::new(),
+                    next_id: 0,
+                })),
                 _lock: lock,
             }),
         })
     }
 
     /// Sends `msg` to the instance of `key` and waits for its reply.
-    pub async fn call(&self, key: &str, mut msg: Vec<u8>) -> Result<Vec<u8>, Error> {
+    pub async fn call(&self, key: &str, mut msg: A::Msg) -> Result<A::Reply, Error> {
         loop {
             let (reply, rx) = oneshot::channel();
             self.send(key, Envelope { msg, reply });
 
             match rx.await {
-                Ok(Reply::Done(result)) => return result,
-                Ok(Reply::Retry(m)) => msg = m,
+                Ok(Response::Done(result)) => return result,
+                Ok(Response::Retry(m)) => msg = m,
                 Err(_) => return Err(Error::Stopped),
             }
         }
@@ -105,7 +107,7 @@ impl<A: Actor> Runtime<A> {
 
     // Sends under the registry lock, so an instance that finds its mailbox
     // empty under the same lock can stop without losing a message.
-    fn send(&self, key: &str, env: Envelope) {
+    fn send(&self, key: &str, env: Envelope<A>) {
         let mut registry = self.inner.registry.lock().unwrap();
 
         if let Some(entry) = registry.entries.get(key) {
@@ -138,15 +140,15 @@ impl<A: Actor> Runtime<A> {
 /// Removes its entry and sends back the calls it did not serve when it
 /// drops, also on a panic. A new instance of the key can start only after
 /// that.
-struct Mailbox {
+struct Mailbox<A: Actor> {
     key: String,
     id: u64,
-    rx: mpsc::UnboundedReceiver<Envelope>,
-    registry: Arc<Mutex<Registry>>,
+    rx: mpsc::UnboundedReceiver<Envelope<A>>,
+    registry: Arc<Mutex<Registry<A>>>,
 }
 
-impl Mailbox {
-    fn remove_entry(&self, registry: &mut Registry) {
+impl<A: Actor> Mailbox<A> {
+    fn remove_entry(&self, registry: &mut Registry<A>) {
         if registry
             .entries
             .get(&self.key)
@@ -170,7 +172,7 @@ impl Mailbox {
     }
 }
 
-impl Drop for Mailbox {
+impl<A: Actor> Drop for Mailbox<A> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
         self.remove_entry(&mut registry);
@@ -179,23 +181,23 @@ impl Drop for Mailbox {
         self.rx.close();
 
         while let Ok(env) = self.rx.try_recv() {
-            env.reply.send(Reply::Retry(env.msg)).ok();
+            env.reply.send(Response::Retry(env.msg)).ok();
         }
     }
 }
 
 // The mailbox drops after the locals of serve, so the storage of this
 // instance is closed before a new instance of the key can open it.
-async fn run<A: Actor>(inner: Arc<Inner<A>>, mut mailbox: Mailbox) {
+async fn run<A: Actor>(inner: Arc<Inner<A>>, mut mailbox: Mailbox<A>) {
     serve(&inner, &mut mailbox).await;
 }
 
-async fn serve<A: Actor>(inner: &Inner<A>, mailbox: &mut Mailbox) {
+async fn serve<A: Actor>(inner: &Inner<A>, mailbox: &mut Mailbox<A>) {
     let mut ctx = match Ctx::open(&inner.objects, mailbox.key.clone()) {
         Ok(ctx) => ctx,
         Err(e) => {
             let env = mailbox.rx.try_recv().unwrap();
-            env.reply.send(Reply::Done(Err(e))).ok();
+            env.reply.send(Response::Done(Err(e))).ok();
 
             return;
         }
@@ -216,7 +218,7 @@ async fn serve<A: Actor>(inner: &Inner<A>, mailbox: &mut Mailbox) {
         };
 
         let failed = result.is_err();
-        env.reply.send(Reply::Done(result)).ok();
+        env.reply.send(Response::Done(result)).ok();
 
         if failed {
             return;

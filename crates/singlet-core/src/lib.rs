@@ -18,9 +18,12 @@ pub use runtime::Runtime;
 /// returns `Ok`, before the caller gets the reply. A turn that returns `Err`
 /// discards its writes and the instance, so memory and storage stay in step.
 pub trait Actor: Send + 'static {
+    type Msg: Send + 'static;
+    type Reply: Send + 'static;
+
     fn handle(
         &mut self,
         ctx: &mut Ctx,
-        msg: Vec<u8>,
-    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send;
+        msg: Self::Msg,
+    ) -> impl Future<Output = Result<Self::Reply, Error>> + Send;
 }

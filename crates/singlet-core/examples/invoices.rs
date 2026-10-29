@@ -13,7 +13,10 @@ use singlet_core::Runtime;
 struct Ledger;
 
 impl Actor for Ledger {
-    async fn handle(&mut self, ctx: &mut Ctx, msg: Vec<u8>) -> Result<Vec<u8>, Error> {
+    type Msg = String;
+    type Reply = String;
+
+    async fn handle(&mut self, ctx: &mut Ctx, body: String) -> Result<String, Error> {
         let next = match ctx.get("next")? {
             Some(v) => u64::from_le_bytes(v.try_into().unwrap()),
             None => 1,
@@ -21,13 +24,13 @@ impl Actor for Ledger {
 
         let number = format!("{}-{next:06}", ctx.key());
         ctx.put("next", &(next + 1).to_le_bytes())?;
-        ctx.put(&number, &msg)?;
+        ctx.put(&number, body.as_bytes())?;
 
-        if msg.is_empty() {
+        if body.is_empty() {
             return Err(Error::Actor("empty invoice".into()));
         }
 
-        Ok(number.into_bytes())
+        Ok(number)
     }
 }
 
@@ -36,11 +39,11 @@ async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
     let rt = Runtime::open(dir.path(), Duration::from_secs(60), |_| Ledger)?;
 
-    let invoices = [&b"120 EUR"[..], b"", b"80 EUR", b"45 EUR"];
+    let invoices = ["120 EUR", "", "80 EUR", "45 EUR"];
 
     for body in invoices {
-        match rt.call("ACME", body.to_vec()).await {
-            Ok(number) => println!("issued {}", String::from_utf8(number).unwrap()),
+        match rt.call("ACME", body.to_owned()).await {
+            Ok(number) => println!("issued {number}"),
             Err(e) => println!("rejected: {e}"),
         }
     }

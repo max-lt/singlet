@@ -20,19 +20,22 @@ struct Bucket {
 }
 
 impl Actor for Bucket {
-    async fn handle(&mut self, _ctx: &mut Ctx, _msg: Vec<u8>) -> Result<Vec<u8>, Error> {
+    type Msg = ();
+    type Reply = u16;
+
+    async fn handle(&mut self, _ctx: &mut Ctx, _: ()) -> Result<u16, Error> {
         let now = Instant::now();
         let refill = now.duration_since(self.at).as_secs_f64() * REFILL_PER_SEC;
         self.tokens = (self.tokens + refill).min(CAPACITY);
         self.at = now;
 
         if self.tokens < 1.0 {
-            return Ok(b"429".to_vec());
+            return Ok(429);
         }
 
         self.tokens -= 1.0;
 
-        Ok(b"200".to_vec())
+        Ok(200)
     }
 }
 
@@ -48,7 +51,7 @@ async fn main() -> Result<(), Error> {
         let mut codes = Vec::new();
 
         for _ in 0..8 {
-            codes.push(String::from_utf8(rt.call(key, vec![]).await?).unwrap());
+            codes.push(rt.call(key, ()).await?.to_string());
         }
 
         println!("{key}: {}", codes.join(" "));
@@ -56,7 +59,7 @@ async fn main() -> Result<(), Error> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let code = String::from_utf8(rt.call("key-a", vec![]).await?).unwrap();
+    let code = rt.call("key-a", ()).await?;
     println!("key-a after 2 s: {code}");
 
     Ok(())
