@@ -10,6 +10,7 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
 
 use crate::Actor;
@@ -67,7 +68,7 @@ struct Registry<A: Actor> {
 
 struct Entry<A: Actor> {
     id: u64,
-    tx: mpsc::UnboundedSender<Job<A>>,
+    tx: mpsc::Sender<Job<A>>,
 }
 
 enum Job<A: Actor> {
@@ -90,6 +91,8 @@ impl<A: Actor> Runtime<A> {
         options: Options,
         make: impl Fn(&A::Key) -> A + Send + Sync + 'static,
     ) -> Result<Self, Error> {
+        assert!(options.mailbox > 0, "Options::mailbox must be at least 1");
+
         let dir = dir.into();
         let objects = dir.join("objects");
         std::fs::create_dir_all(&objects)?;
@@ -129,7 +132,7 @@ impl<A: Actor> Runtime<A> {
     {
         loop {
             let (reply, rx) = oneshot::channel();
-            self.send(key, Job::Call(msg, reply));
+            self.send(key, Job::Call(msg, reply))?;
 
             match rx.await {
                 Ok(Response::Done(result)) => return result,
@@ -141,14 +144,14 @@ impl<A: Actor> Runtime<A> {
 
     async fn alarm(&self, key: &A::Key) -> Result<(), Error> {
         let (done, rx) = oneshot::channel();
-        self.send(key, Job::Alarm(done));
+        self.send(key, Job::Alarm(done))?;
 
         rx.await.unwrap_or(Err(Error::Stopped))
     }
 
     // Sends under the registry lock, so an instance that finds its mailbox
     // empty under the same lock can stop without losing a message.
-    fn send<Q>(&self, key: &Q, job: Job<A>)
+    fn send<Q>(&self, key: &Q, job: Job<A>) -> Result<(), Error>
     where
         A::Key: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
@@ -156,19 +159,20 @@ impl<A: Actor> Runtime<A> {
         let mut registry = self.inner.registry.lock().unwrap();
 
         if let Some(entry) = registry.entries.get(key) {
-            entry
-                .tx
-                .send(job)
-                .unwrap_or_else(|_| unreachable!("a mailbox closes after its entry goes"));
-
-            return;
+            return match entry.tx.try_send(job) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => Err(Error::Overloaded),
+                Err(TrySendError::Closed(_)) => {
+                    unreachable!("a mailbox closes after its entry goes")
+                }
+            };
         }
 
         let id = registry.next_id;
         registry.next_id += 1;
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(job).unwrap();
+        let (tx, rx) = mpsc::channel(self.inner.options.mailbox);
+        tx.try_send(job).unwrap();
         let key = key.to_owned();
         registry.entries.insert(key.clone(), Entry { id, tx });
 
@@ -180,6 +184,8 @@ impl<A: Actor> Runtime<A> {
         };
 
         tokio::spawn(run(mailbox));
+
+        Ok(())
     }
 }
 
@@ -189,7 +195,7 @@ impl<A: Actor> Runtime<A> {
 struct Mailbox<A: Actor> {
     key: A::Key,
     id: u64,
-    rx: mpsc::UnboundedReceiver<Job<A>>,
+    rx: mpsc::Receiver<Job<A>>,
     inner: Arc<Inner<A>>,
 }
 

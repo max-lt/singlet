@@ -69,7 +69,15 @@ impl Actor for Counter {
 }
 
 fn open(dir: &tempfile::TempDir) -> Runtime<Counter> {
-    Runtime::open(dir.path(), Options { idle: IDLE }, |_| Counter::default()).unwrap()
+    Runtime::open(
+        dir.path(),
+        Options {
+            idle: IDLE,
+            ..Options::default()
+        },
+        |_| Counter::default(),
+    )
+    .unwrap()
 }
 
 fn count(stored: u64, served: u64) -> Count {
@@ -172,6 +180,50 @@ async fn one_runtime_per_directory() {
     let dir = tempfile::tempdir().unwrap();
     let _rt = open(&dir);
 
-    let second = Runtime::open(dir.path(), Options { idle: IDLE }, |_| Counter::default());
+    let second = Runtime::open(
+        dir.path(),
+        Options {
+            idle: IDLE,
+            ..Options::default()
+        },
+        |_| Counter::default(),
+    );
     assert!(matches!(second, Err(Error::Locked)));
+}
+
+#[tokio::test]
+async fn a_full_mailbox_refuses_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        idle: IDLE,
+        mailbox: 2,
+    };
+    let rt = Runtime::open(dir.path(), options, |_| Counter::default()).unwrap();
+
+    let slow = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.call("room", Cmd::Slow).await })
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let waiting: Vec<_> = (0..2)
+        .map(|_| {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.call("room", Cmd::Inc).await })
+        })
+        .collect();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(matches!(
+        rt.call("room", Cmd::Inc).await,
+        Err(Error::Overloaded)
+    ));
+
+    slow.await.unwrap().unwrap();
+
+    for call in waiting {
+        call.await.unwrap().unwrap();
+    }
 }

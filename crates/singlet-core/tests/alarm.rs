@@ -69,9 +69,14 @@ fn fired(ctx: &Ctx) -> Result<u64, Error> {
 }
 
 fn open(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Result<Runtime<Clock>, Error> {
-    Runtime::open(dir.path(), Options { idle: IDLE }, move |_| Clock {
-        failures,
-    })
+    Runtime::open(
+        dir.path(),
+        Options {
+            idle: IDLE,
+            ..Options::default()
+        },
+        move |_| Clock { failures },
+    )
 }
 
 async fn reopen(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Runtime<Clock> {

@@ -103,7 +103,14 @@ fn fired(ctx: &Ctx) -> Result<u64, Error> {
 }
 
 fn open(dir: &Path) -> Result<Runtime<Counter>, Error> {
-    Runtime::open(dir, Options { idle: IDLE }, |_| Counter)
+    Runtime::open(
+        dir,
+        Options {
+            idle: IDLE,
+            ..Options::default()
+        },
+        |_| Counter,
+    )
 }
 
 fuzz_target!(|ops: Vec<Op>| {

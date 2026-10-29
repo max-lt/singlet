@@ -45,6 +45,7 @@ async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
     let options = Options {
         idle: Duration::from_millis(100),
+        ..Options::default()
     };
     let rt = Runtime::open(dir.path(), options, |id: &String| Order { id: id.clone() })?;
 

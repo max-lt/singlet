@@ -9,6 +9,10 @@ pub enum Error {
     #[error("data directory is in use by another runtime")]
     Locked,
 
+    /// The mailbox of the key is full. The call did not run.
+    #[error("too many calls wait for this key")]
+    Overloaded,
+
     /// The instance panicked during the call. The turn did not commit.
     #[error("instance stopped before it replied")]
     Stopped,
