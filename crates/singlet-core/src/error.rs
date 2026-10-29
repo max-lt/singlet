@@ -18,6 +18,7 @@ pub enum Error {
     Stopped,
 
     /// From [`Actor::handle`](crate::Actor::handle). The turn did not commit.
+    /// The caller gets the error of the actor back with `downcast_ref`.
     #[error("{0}")]
-    Actor(String),
+    Actor(Box<dyn std::error::Error + Send + Sync>),
 }

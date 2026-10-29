@@ -16,6 +16,10 @@ enum Cmd {
     Slow,
 }
 
+#[derive(Debug, PartialEq, thiserror::Error)]
+#[error("refused with code {0}")]
+struct Refused(u32);
+
 #[derive(Debug, PartialEq)]
 struct Count {
     stored: u64,
@@ -50,7 +54,7 @@ impl Actor for Counter {
             Cmd::Fail => {
                 ctx.put("n", &1000u64.to_le_bytes())?;
 
-                return Err(Error::Actor("fail".into()));
+                return Err(Error::Actor(Box::new(Refused(7))));
             }
             Cmd::Panic => panic!("panic"),
             Cmd::Slow => {
@@ -138,10 +142,11 @@ async fn a_failed_turn_discards_its_writes_and_the_instance() {
     let rt = open(&dir);
     rt.call("room", Cmd::Inc).await.unwrap();
 
-    assert!(matches!(
-        rt.call("room", Cmd::Fail).await,
-        Err(Error::Actor(_))
-    ));
+    let Err(Error::Actor(e)) = rt.call("room", Cmd::Fail).await else {
+        panic!("the turn must fail with the error of the actor");
+    };
+
+    assert_eq!(e.downcast_ref::<Refused>(), Some(&Refused(7)));
     assert_eq!(rt.call("room", Cmd::Get).await.unwrap(), count(1, 1));
 }
 
