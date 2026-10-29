@@ -207,6 +207,48 @@ async fn shutdown_stops_a_scheduler_that_waits_to_retry() {
     );
 }
 
+fn open_with_max_live(dir: &tempfile::TempDir, max_live: usize) -> Runtime<Clock> {
+    let options = Options {
+        max_live,
+        ..Options::default()
+    };
+
+    Runtime::open(dir.path(), options, |_| Clock::default()).unwrap()
+}
+
+#[tokio::test]
+async fn a_new_key_at_max_live_stops_an_idle_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = open_with_max_live(&dir, 2);
+
+    for key in ["a", "b", "c", "a", "d", "b"] {
+        rt.call(key, Cmd::Inc).await.unwrap();
+    }
+
+    assert_eq!(rt.inner.peak.load(SeqCst), 2);
+    assert_eq!(rt.call("a", Cmd::Get).await.unwrap(), 2);
+    assert_eq!(rt.call("b", Cmd::Get).await.unwrap(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_key_fails_at_max_live_when_every_instance_has_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = open_with_max_live(&dir, 1);
+
+    let hung = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.call("a", Cmd::Hang).await })
+    };
+
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let b = tokio::time::timeout(Duration::from_secs(1), rt.call("b", Cmd::Get)).await;
+    assert!(matches!(b, Ok(Err(Error::Overloaded))));
+
+    rt.shutdown(DEADLINE).await.ok();
+    hung.await.unwrap().ok();
+}
+
 #[tokio::test]
 async fn a_failed_commit_gives_error_commit() {
     let dir = tempfile::tempdir().unwrap();

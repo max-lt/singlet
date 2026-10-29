@@ -77,6 +77,9 @@ cargo run --example stock
   it runs, so its failure drops the alarm. An alarm can run more than once.
 - Above `Options::mailbox` (1024) waiting calls for one key, a call fails at
   once with `Error::Overloaded`.
+- `Options::max_live` (1024) instances run at once. To start one more, a
+  call stops an idle instance and waits for its slot. If every instance has
+  work, the call fails at once with `Error::Overloaded`.
 - A panic stops the instance. Its caller gets `Error::Stopped`. Calls that
   wait in the mailbox go to the new instance.
 - `Runtime::open` must run inside a Tokio runtime.
@@ -119,8 +122,8 @@ and reads the index again after 1 s, until a read succeeds.
   one turn at a time. A cycle of calls between keys waits for ever too. The
   deadline of `Runtime::shutdown` aborts these turns.
 - Each running instance holds 3 file descriptors: its file, the WAL and the
-  shared memory. There is no limit on running instances. Above `ulimit -n`,
-  a call that starts an instance fails with `Error::Storage`.
+  shared memory. Set `ulimit -n` above 3 times `Options::max_live`, or a
+  call that starts an instance fails with `Error::Storage`.
 
 ## Fuzzing
 

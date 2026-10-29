@@ -19,9 +19,12 @@ impl From<Error> for TurnError {
     }
 }
 
-/// Lets a shutdown abort the turn of an instance, but not its commit.
+/// The state of an instance that the runtime reads: a shutdown aborts its
+/// turn but not its commit, and max_live stops it only when it is idle.
 pub(super) struct Control {
     pub(super) stop: AtomicBool,
+    // Set during a turn, so max_live does not stop this instance.
+    pub(super) busy: AtomicBool,
     // Holds its permit, so a turn that starts after the stop is aborted.
     pub(super) cancel: Notify,
     #[cfg(test)]

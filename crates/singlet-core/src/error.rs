@@ -26,8 +26,10 @@ pub enum Error {
     #[error("commit failed, and the turn may have committed")]
     Commit(#[source] rusqlite::Error),
 
-    /// The mailbox of the key is full. The call did not run.
-    #[error("too many calls wait for this key")]
+    /// The mailbox of the key is full, or every instance has work at
+    /// [`Options::max_live`](crate::Options::max_live). The call did not
+    /// run.
+    #[error("too much work: the mailbox of the key is full, or every instance has work")]
     Overloaded,
 
     /// The call did not begin, because the runtime is shut down.

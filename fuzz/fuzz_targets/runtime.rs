@@ -1,6 +1,7 @@
 //! Runs random calls, bursts, alarms, pauses and restarts against a counter
 //! per key, and checks every reply against a model. The pauses are near the
-//! idle time, so instances stop while calls and alarms arrive.
+//! idle time, so instances stop while calls and alarms arrive. MAX_LIVE is
+//! below KEYS, so a new key often stops an idle instance.
 
 #![no_main]
 
@@ -19,6 +20,7 @@ use singlet_core::Options;
 use singlet_core::Runtime;
 
 const KEYS: u64 = 4;
+const MAX_LIVE: usize = 2;
 const IDLE: Duration = Duration::from_millis(2);
 const MAX_BURST: u8 = 16;
 const ALARM_DEADLINE: Duration = Duration::from_secs(10);
@@ -109,10 +111,21 @@ fn open(dir: &Path) -> Result<Runtime<Counter>, Error> {
         dir,
         Options {
             idle: IDLE,
+            max_live: MAX_LIVE,
             ..Options::default()
         },
         |_| Counter,
     )
+}
+
+// An Overloaded call did not run, so the model stays the same.
+async fn call(rt: &Runtime<Counter>, key: u64, cmd: Cmd) -> Result<u64, Error> {
+    loop {
+        match rt.call(&key, cmd).await {
+            Err(Error::Overloaded) => tokio::time::sleep(IDLE).await,
+            reply => return reply,
+        }
+    }
 }
 
 fuzz_target!(|ops: Vec<Op>| {
@@ -130,7 +143,7 @@ async fn check(ops: Vec<Op>) {
             Op::Call { key, cmd } => {
                 let key = u64::from(key) % KEYS;
                 let count = &mut model[key as usize];
-                let reply = rt.call(&key, cmd).await;
+                let reply = call(&rt, key, cmd).await;
 
                 match cmd {
                     Cmd::Inc => {
@@ -156,7 +169,7 @@ async fn check(ops: Vec<Op>) {
                 let tasks: Vec<_> = (0..n)
                     .map(|_| {
                         let rt = rt.clone();
-                        tokio::spawn(async move { rt.call(&key, Cmd::Inc).await.unwrap() })
+                        tokio::spawn(async move { call(&rt, key, Cmd::Inc).await.unwrap() })
                     })
                     .collect();
 
@@ -186,17 +199,17 @@ async fn check(ops: Vec<Op>) {
     let deadline = Instant::now() + ALARM_DEADLINE;
 
     for key in 0..KEYS {
-        while rt.call(&key, Cmd::Pending).await.unwrap() == 1 {
+        while call(&rt, key, Cmd::Pending).await.unwrap() == 1 {
             assert!(Instant::now() < deadline, "alarm of key {key} never fired");
             tokio::time::sleep(IDLE).await;
         }
 
-        let fired = rt.call(&key, Cmd::Fired).await.unwrap();
+        let fired = call(&rt, key, Cmd::Fired).await.unwrap();
         assert_eq!(
             fired > 0,
             armed[key as usize],
             "key {key} fired {fired} times"
         );
-        assert_eq!(rt.call(&key, Cmd::Get).await.unwrap(), model[key as usize]);
+        assert_eq!(call(&rt, key, Cmd::Get).await.unwrap(), model[key as usize]);
     }
 }

@@ -76,6 +76,9 @@ struct Inner<A: Actor> {
     lock: Mutex<Option<File>>,
     #[cfg(test)]
     gate: Mutex<Option<Arc<Gate>>>,
+    // The most instances that ran at once.
+    #[cfg(test)]
+    peak: AtomicUsize,
 }
 
 impl<A: Actor> Inner<A> {
@@ -111,6 +114,19 @@ struct Registry<A: Actor> {
 struct Entry<A: Actor> {
     id: u64,
     tx: mpsc::Sender<Job<A>>,
+    control: Arc<Control>,
+}
+
+impl<A: Actor> Entry<A> {
+    fn is_idle(&self) -> bool {
+        self.tx.capacity() == self.tx.max_capacity() && !self.control.busy.load(SeqCst)
+    }
+}
+
+enum Sent<A: Actor> {
+    Done,
+    // The runtime runs max_live instances, and one of them stops soon.
+    Wait(Job<A>),
 }
 
 enum Job<A: Actor> {
@@ -141,6 +157,7 @@ impl<A: Actor> Runtime<A> {
         make: impl Fn(&A::Key) -> A + Send + Sync + 'static,
     ) -> Result<Self, Error> {
         assert!(options.mailbox > 0, "Options::mailbox must be at least 1");
+        assert!(options.max_live > 0, "Options::max_live must be at least 1");
 
         let dir = dir.into();
         let objects = dir.join("objects");
@@ -173,6 +190,8 @@ impl<A: Actor> Runtime<A> {
             lock: Mutex::new(Some(lock)),
             #[cfg(test)]
             gate: Mutex::default(),
+            #[cfg(test)]
+            peak: AtomicUsize::new(0),
         });
 
         let scheduler = tokio::spawn(schedule(Arc::downgrade(&inner), index));
@@ -193,7 +212,7 @@ impl<A: Actor> Runtime<A> {
     {
         loop {
             let (reply, rx) = oneshot::channel();
-            self.send(key, Job::Call(msg, reply))?;
+            self.send(key, Job::Call(msg, reply)).await?;
 
             match rx.await {
                 Ok(Response::Done(result)) => return result,
@@ -271,14 +290,32 @@ impl<A: Actor> Runtime<A> {
 
     async fn alarm(&self, key: &A::Key, on_failure: OnFailure) -> Result<(), Error> {
         let (done, rx) = oneshot::channel();
-        self.send(key, Job::Alarm(on_failure, done))?;
+        self.send(key, Job::Alarm(on_failure, done)).await?;
 
         rx.await.unwrap_or(Err(Error::Stopped))
     }
 
+    async fn send<Q>(&self, key: &Q, mut job: Job<A>) -> Result<(), Error>
+    where
+        A::Key: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
+    {
+        let max_live = self.inner.options.max_live;
+
+        loop {
+            match self.try_send(key, job)? {
+                Sent::Done => return Ok(()),
+                Sent::Wait(back) => job = back,
+            }
+
+            let mut live = self.inner.live.subscribe();
+            live.wait_for(|n| *n < max_live).await.ok();
+        }
+    }
+
     // Sends under the registry lock, so an instance that finds its mailbox
     // empty under the same lock can stop without losing a message.
-    fn send<Q>(&self, key: &Q, job: Job<A>) -> Result<(), Error>
+    fn try_send<Q>(&self, key: &Q, job: Job<A>) -> Result<Sent<A>, Error>
     where
         A::Key: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
@@ -287,7 +324,7 @@ impl<A: Actor> Runtime<A> {
 
         if let Some(entry) = registry.entries.get(key) {
             return match entry.tx.try_send(job) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(Sent::Done),
                 Err(TrySendError::Full(_)) => Err(Error::Overloaded),
                 Err(TrySendError::Closed(_)) => {
                     unreachable!("a mailbox closes after its entry goes")
@@ -299,22 +336,53 @@ impl<A: Actor> Runtime<A> {
             return Err(Error::Closed);
         }
 
+        let live = *self.inner.live.borrow();
+
+        if live >= self.inner.options.max_live {
+            // An instance with no entry stops soon and frees its slot.
+            if live == registry.entries.len() {
+                let idle = registry
+                    .entries
+                    .iter()
+                    .find(|(_, entry)| entry.is_idle())
+                    .map(|(key, _)| key.clone());
+
+                let Some(idle) = idle else {
+                    return Err(Error::Overloaded);
+                };
+
+                // With no entry, the instance gets no call and stops.
+                registry.entries.remove::<A::Key>(&idle);
+            }
+
+            return Ok(Sent::Wait(job));
+        }
+
         let id = registry.next_id;
         registry.next_id += 1;
 
-        let (tx, rx) = mpsc::channel(self.inner.options.mailbox);
-        tx.try_send(job).unwrap();
-        let key = key.to_owned();
-        registry.entries.insert(key.clone(), Entry { id, tx });
-
         let control = Arc::new(Control {
             stop: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             cancel: Notify::new(),
             #[cfg(test)]
             gate: self.inner.gate.lock().unwrap().clone(),
         });
+
+        let (tx, rx) = mpsc::channel(self.inner.options.mailbox);
+        tx.try_send(job).unwrap();
+        let key = key.to_owned();
+        let entry = Entry {
+            id,
+            tx,
+            control: control.clone(),
+        };
+        registry.entries.insert(key.clone(), entry);
         registry.controls.insert(id, control.clone());
         self.inner.live.send_modify(|n| *n += 1);
+
+        #[cfg(test)]
+        self.inner.peak.fetch_max(*self.inner.live.borrow(), SeqCst);
 
         let mailbox = Mailbox {
             key,
@@ -326,7 +394,7 @@ impl<A: Actor> Runtime<A> {
 
         tokio::spawn(run(mailbox));
 
-        Ok(())
+        Ok(Sent::Done)
     }
 }
 
@@ -442,6 +510,8 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
             return;
         }
 
+        control.busy.store(true, SeqCst);
+
         let failed = match job {
             Job::Call(msg, reply) => {
                 let result = call_turn(actor, ctx, control, msg).await;
@@ -468,6 +538,8 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
         if failed {
             return;
         }
+
+        control.busy.store(false, SeqCst);
     }
 }
 
