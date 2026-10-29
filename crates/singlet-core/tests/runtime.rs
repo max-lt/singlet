@@ -238,6 +238,18 @@ async fn a_file_of_another_format_does_not_open() {
 }
 
 #[tokio::test]
+async fn a_file_with_tables_and_no_format_does_not_open() {
+    let dir = tempfile::tempdir().unwrap();
+    rusqlite::Connection::open(dir.path().join("alarms.sqlite"))
+        .unwrap()
+        .execute_batch("CREATE TABLE alarms (key TEXT, at TEXT);")
+        .unwrap();
+
+    let rt = Runtime::open(dir.path(), Options::default(), |_| Counter::default());
+    assert!(matches!(rt, Err(Error::Format(0))));
+}
+
+#[tokio::test]
 async fn a_full_mailbox_refuses_the_call() {
     let dir = tempfile::tempdir().unwrap();
     let options = Options {

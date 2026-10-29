@@ -8,15 +8,19 @@ use crate::Error;
 const FORMAT: i64 = 1;
 
 /// Opens a SQLite file in WAL mode with `synchronous=FULL`, and creates its
-/// tables with `schema` on the first open.
+/// tables with `schema` if the file is new.
 pub(crate) fn open(path: &Path, schema: &str) -> Result<Connection, Error> {
     let conn = Connection::open(path)?;
     conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
     conn.pragma_update(None, "synchronous", "FULL")?;
 
-    match conn.pragma_query_value(None, "user_version", |row| row.get(0))? {
+    let format = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
+
+    match format {
         FORMAT => {}
-        0 => conn.execute_batch(&format!(
+        // Tables with no version have an unknown layout.
+        0 if tables == 0 => conn.execute_batch(&format!(
             "BEGIN; {schema} PRAGMA user_version = {FORMAT}; COMMIT;"
         ))?,
         other => return Err(Error::Format(other)),

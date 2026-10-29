@@ -40,8 +40,8 @@ impl Ctx {
 
         let conn = db::open(
             &dir.join(format!("{name}.sqlite")),
-            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS alarm (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);",
+            "CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+             CREATE TABLE alarm (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);",
         )?;
 
         Ok(Self {

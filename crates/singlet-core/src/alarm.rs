@@ -26,8 +26,8 @@ impl Index {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
         let conn = db::open(
             path,
-            "CREATE TABLE IF NOT EXISTS alarms (key BLOB PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS alarms_at ON alarms (at);",
+            "CREATE TABLE alarms (key BLOB PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE INDEX alarms_at ON alarms (at);",
         )?;
 
         Ok(Self {
