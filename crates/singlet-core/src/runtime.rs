@@ -22,6 +22,7 @@ use crate::alarm;
 use crate::alarm::Index;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const INDEX_RETRY: Duration = Duration::from_secs(1);
 
 /// Routes calls to one instance per key, and wakes instances for their
 /// alarms.
@@ -335,24 +336,32 @@ async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
                 return;
             };
 
-            let now = alarm::now_ms();
+            spawn_due(&strong, &index)
+        };
 
-            for key in index.take_due(now).expect("alarm index is readable") {
-                tokio::spawn(deliver(Arc::downgrade(&strong), index.clone(), key));
+        let wait = match next {
+            Ok(Some(at)) => Duration::from_millis((at - alarm::now_ms()).max(0).cast_unsigned()),
+            Ok(None) => {
+                index.wake.notified().await;
+                continue;
             }
-
-            index.next_after(now).expect("alarm index is readable")
+            // The index is a hint, so a failed read only delays the alarms.
+            Err(_) => INDEX_RETRY,
         };
-
-        let Some(at) = next else {
-            index.wake.notified().await;
-            continue;
-        };
-
-        let wait = Duration::from_millis((at - alarm::now_ms()).max(0).cast_unsigned());
 
         tokio::time::timeout(wait, index.wake.notified()).await.ok();
     }
+}
+
+/// Starts a delivery for each due alarm, and returns the next alarm.
+fn spawn_due<A: Actor>(inner: &Arc<Inner<A>>, index: &Arc<Index>) -> Result<Option<i64>, Error> {
+    let now = alarm::now_ms();
+
+    for key in index.take_due(now)? {
+        tokio::spawn(deliver(Arc::downgrade(inner), index.clone(), key));
+    }
+
+    index.next_after(now)
 }
 
 async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8>) {
