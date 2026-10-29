@@ -36,7 +36,8 @@ pub trait Actor: Send + 'static {
 
     /// Runs when the alarm set with [`Ctx::set_alarm`] is due. The alarm is
     /// cleared before this turn, so the turn can set the next one. A turn
-    /// that fails keeps the alarm, and the runtime tries again with backoff.
+    /// that fails keeps the alarm, and the runtime tries again with backoff,
+    /// [`Options::alarm_retries`] times at most.
     fn alarm(&mut self, ctx: &mut Ctx) -> impl Future<Output = Result<(), Error>> + Send {
         let _ = ctx;
 
