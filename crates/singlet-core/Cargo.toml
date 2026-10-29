@@ -3,8 +3,12 @@ name = "singlet-core"
 version = "0.1.0"
 description = "One instance per key, with its own SQLite storage"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords = ["actor", "durable-objects", "sqlite", "tokio"]
+categories = ["asynchronous", "concurrency", "database"]
 
 [dependencies]
 rusqlite = { version = "0.41.1", features = ["bundled"] }

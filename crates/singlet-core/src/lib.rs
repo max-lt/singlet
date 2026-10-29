@@ -17,6 +17,10 @@ pub use key::Key;
 pub use options::Options;
 pub use runtime::Runtime;
 
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
+
 /// The code of one instance.
 ///
 /// A turn is one call to `handle` or `alarm`. The writes of a turn commit

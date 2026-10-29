@@ -2,12 +2,13 @@
 default:
     @just --list
 
-# fmt and clippy, for the workspace and the fuzz crate
+# fmt, clippy and docs, for the workspace and the fuzz crate
 check:
     cargo fmt --all --check
     cargo fmt --all --check --manifest-path fuzz/Cargo.toml
     cargo clippy --all-targets -- -D warnings
     cargo +nightly clippy --manifest-path fuzz/Cargo.toml -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 test:
     cargo test

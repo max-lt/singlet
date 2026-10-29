@@ -8,9 +8,7 @@ disk. Code for one key reads like code for one server.
 
 ## Example
 
-```rust
-use std::time::Duration;
-
+```rust,no_run
 use singlet_core::{Actor, Ctx, Error, Options, Runtime};
 
 struct Counter;
@@ -32,8 +30,14 @@ impl Actor for Counter {
     }
 }
 
-let rt = Runtime::open("data", Options::default(), |_key| Counter)?;
-let n = rt.call("room-1", ()).await?;
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let rt = Runtime::open("data", Options::default(), |_| Counter)?;
+    let n = rt.call("room-1", ()).await?;
+    println!("room-1: {n}");
+
+    Ok(())
+}
 ```
 
 ## Examples
@@ -56,8 +60,10 @@ cargo run --example stock
   bytes for different keys, and the same bytes in every version.
 - One call to `handle` is a turn. Calls for one key do not interleave, also
   across an `await`. Calls for different keys run in parallel.
-- The writes of a turn commit when `handle` returns `Ok`, before the caller
-  gets the reply.
+- The writes of a turn commit when `handle` or `alarm` returns `Ok`, before
+  the caller gets the reply.
+- An error from `call` means that the turn did not commit, so the caller can
+  send the call again.
 - A turn that returns `Err` discards its writes and the instance. The next
   call starts a new instance from storage.
 - `ctx.set_alarm(at)` sets the one alarm of an instance. At `at`, the
@@ -94,8 +100,9 @@ then checks its file and does nothing.
 
 ## Fuzzing
 
-The `runtime` target checks each reply against a model, with calls, bursts
-and pauses near the idle time.
+The `runtime` target checks each reply against a model, with calls, bursts,
+alarms and pauses near the idle time. At the end, it reopens the directory
+and checks the stored counts and which keys fired an alarm.
 
 ```sh
 just fuzz       # 300 s
