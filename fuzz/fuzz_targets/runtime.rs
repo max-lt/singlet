@@ -15,6 +15,7 @@ use libfuzzer_sys::fuzz_target;
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 const KEYS: u64 = 4;
@@ -102,7 +103,7 @@ fn fired(ctx: &Ctx) -> Result<u64, Error> {
 }
 
 fn open(dir: &Path) -> Result<Runtime<Counter>, Error> {
-    Runtime::open(dir, IDLE, |_| Counter)
+    Runtime::open(dir, Options { idle: IDLE }, |_| Counter)
 }
 
 fuzz_target!(|ops: Vec<Op>| {

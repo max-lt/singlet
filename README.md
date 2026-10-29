@@ -11,7 +11,7 @@ disk. Code for one key reads like code for one server.
 ```rust
 use std::time::Duration;
 
-use singlet_core::{Actor, Ctx, Error, Runtime};
+use singlet_core::{Actor, Ctx, Error, Options, Runtime};
 
 struct Counter;
 
@@ -32,7 +32,7 @@ impl Actor for Counter {
     }
 }
 
-let rt = Runtime::open("data", Duration::from_secs(60), |_key| Counter)?;
+let rt = Runtime::open("data", Options::default(), |_key| Counter)?;
 let n = rt.call("room-1", ()).await?;
 ```
 

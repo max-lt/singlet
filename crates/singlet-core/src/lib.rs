@@ -8,11 +8,13 @@ mod alarm;
 mod ctx;
 mod error;
 mod key;
+mod options;
 mod runtime;
 
 pub use ctx::Ctx;
 pub use error::Error;
 pub use key::Key;
+pub use options::Options;
 pub use runtime::Runtime;
 
 /// The code of one instance.

@@ -16,6 +16,7 @@ use crate::Actor;
 use crate::Ctx;
 use crate::Error;
 use crate::Key;
+use crate::Options;
 use crate::alarm;
 use crate::alarm::Index;
 
@@ -27,8 +28,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 ///
 /// One runtime owns its data directory; a second `open` on the same
 /// directory fails with [`Error::Locked`], even from another process. The
-/// lock stays until the last instance stops, which can be `idle` after the
-/// runtime drops.
+/// lock stays until the last instance stops, which can be
+/// [`Options::idle`] after the runtime drops.
 pub struct Runtime<A: Actor> {
     inner: Arc<Inner<A>>,
 }
@@ -45,7 +46,7 @@ type Make<A> = Box<dyn Fn(&<A as Actor>::Key) -> A + Send + Sync>;
 
 struct Inner<A: Actor> {
     objects: PathBuf,
-    idle: Duration,
+    options: Options,
     make: Make<A>,
     registry: Mutex<Registry<A>>,
     index: Arc<Index>,
@@ -81,13 +82,12 @@ enum Response<A: Actor> {
 }
 
 impl<A: Actor> Runtime<A> {
-    /// Stops an instance after `idle` without calls. `make` builds the
-    /// instance of a key each time it starts.
+    /// `make` builds the instance of a key each time it starts.
     ///
     /// Must run inside a Tokio runtime: it starts the alarm scheduler.
     pub fn open(
         dir: impl Into<PathBuf>,
-        idle: Duration,
+        options: Options,
         make: impl Fn(&A::Key) -> A + Send + Sync + 'static,
     ) -> Result<Self, Error> {
         let dir = dir.into();
@@ -106,7 +106,7 @@ impl<A: Actor> Runtime<A> {
 
         let inner = Arc::new(Inner {
             objects,
-            idle,
+            options,
             make: Box::new(make),
             registry: Mutex::new(Registry {
                 entries: HashMap::new(),
@@ -256,7 +256,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
     let mut actor = (inner.make)(&mailbox.key);
 
     loop {
-        let job = match tokio::time::timeout(inner.idle, mailbox.rx.recv()).await {
+        let job = match tokio::time::timeout(inner.options.idle, mailbox.rx.recv()).await {
             Ok(job) => job.expect("the entry holds a sender"),
             Err(_) if mailbox.retire() => return,
             Err(_) => continue,

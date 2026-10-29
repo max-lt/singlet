@@ -1,10 +1,9 @@
 //! Many buyers, one stock per product: no overselling, no lock.
 
-use std::time::Duration;
-
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 enum Command {
@@ -51,7 +50,7 @@ impl Actor for Stock {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
-    let rt = Runtime::open(dir.path(), Duration::from_secs(60), |_| Stock)?;
+    let rt = Runtime::open(dir.path(), Options::default(), |_| Stock)?;
 
     rt.call(&42, Command::Restock).await?;
 

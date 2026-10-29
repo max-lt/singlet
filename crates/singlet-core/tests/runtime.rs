@@ -3,6 +3,7 @@ use std::time::Duration;
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 const IDLE: Duration = Duration::from_millis(50);
@@ -68,7 +69,7 @@ impl Actor for Counter {
 }
 
 fn open(dir: &tempfile::TempDir) -> Runtime<Counter> {
-    Runtime::open(dir.path(), IDLE, |_| Counter::default()).unwrap()
+    Runtime::open(dir.path(), Options { idle: IDLE }, |_| Counter::default()).unwrap()
 }
 
 fn count(stored: u64, served: u64) -> Count {
@@ -171,6 +172,6 @@ async fn one_runtime_per_directory() {
     let dir = tempfile::tempdir().unwrap();
     let _rt = open(&dir);
 
-    let second = Runtime::open(dir.path(), IDLE, |_| Counter::default());
+    let second = Runtime::open(dir.path(), Options { idle: IDLE }, |_| Counter::default());
     assert!(matches!(second, Err(Error::Locked)));
 }

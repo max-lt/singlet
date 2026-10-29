@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 const IDLE: Duration = Duration::from_millis(50);
@@ -68,7 +69,9 @@ fn fired(ctx: &Ctx) -> Result<u64, Error> {
 }
 
 fn open(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Result<Runtime<Clock>, Error> {
-    Runtime::open(dir.path(), IDLE, move |_| Clock { failures })
+    Runtime::open(dir.path(), Options { idle: IDLE }, move |_| Clock {
+        failures,
+    })
 }
 
 async fn reopen(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Runtime<Clock> {

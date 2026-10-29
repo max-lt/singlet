@@ -3,11 +3,10 @@
 //! A failed turn discards its writes, so a number is used only when the
 //! invoice is accepted.
 
-use std::time::Duration;
-
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 struct Ledger {
@@ -40,10 +39,8 @@ impl Actor for Ledger {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
-    let rt = Runtime::open(dir.path(), Duration::from_secs(60), |company: &String| {
-        Ledger {
-            company: company.clone(),
-        }
+    let rt = Runtime::open(dir.path(), Options::default(), |company: &String| Ledger {
+        company: company.clone(),
     })?;
 
     let invoices = ["120 EUR", "", "80 EUR", "45 EUR"];

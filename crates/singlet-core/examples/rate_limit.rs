@@ -9,6 +9,7 @@ use std::time::Instant;
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 const CAPACITY: f64 = 5.0;
@@ -43,7 +44,7 @@ impl Actor for Bucket {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
-    let rt = Runtime::open(dir.path(), Duration::from_secs(60), |_| Bucket {
+    let rt = Runtime::open(dir.path(), Options::default(), |_| Bucket {
         tokens: CAPACITY,
         at: Instant::now(),
     })?;

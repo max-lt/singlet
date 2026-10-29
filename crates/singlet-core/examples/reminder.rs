@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use singlet_core::Actor;
 use singlet_core::Ctx;
 use singlet_core::Error;
+use singlet_core::Options;
 use singlet_core::Runtime;
 
 const PAY_WITHIN: Duration = Duration::from_millis(300);
@@ -42,9 +43,10 @@ impl Actor for Order {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let dir = tempfile::tempdir()?;
-    let rt = Runtime::open(dir.path(), Duration::from_millis(100), |id: &String| {
-        Order { id: id.clone() }
-    })?;
+    let options = Options {
+        idle: Duration::from_millis(100),
+    };
+    let rt = Runtime::open(dir.path(), options, |id: &String| Order { id: id.clone() })?;
 
     rt.call("order-1", Command::Place).await?;
     rt.call("order-2", Command::Place).await?;
