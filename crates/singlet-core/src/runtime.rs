@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use crate::Actor;
 use crate::Ctx;
@@ -61,6 +62,7 @@ struct Inner<A: Actor> {
     index: Arc<Index>,
     // Ends when every instance has stopped after a shutdown.
     stopped: Mutex<Option<mpsc::Receiver<()>>>,
+    scheduler: Mutex<Option<JoinHandle<()>>>,
     lock: Mutex<Option<File>>,
 }
 
@@ -137,10 +139,12 @@ impl<A: Actor> Runtime<A> {
             }),
             index: index.clone(),
             stopped: Mutex::new(Some(stopped)),
+            scheduler: Mutex::default(),
             lock: Mutex::new(Some(lock)),
         });
 
-        tokio::spawn(schedule(Arc::downgrade(&inner), index));
+        let scheduler = tokio::spawn(schedule(Arc::downgrade(&inner), index));
+        *inner.scheduler.lock().unwrap() = Some(scheduler);
 
         Ok(Self { inner })
     }
@@ -187,6 +191,13 @@ impl<A: Actor> Runtime<A> {
         };
 
         stopped.recv().await;
+
+        let scheduler = self.inner.scheduler.lock().unwrap().take();
+
+        if let Some(scheduler) = scheduler {
+            scheduler.await.ok();
+        }
+
         self.inner.lock.lock().unwrap().take();
     }
 
@@ -377,6 +388,8 @@ async fn alarm_turn<A: Actor>(
 // Holds the runtime only while it reads the index, so a dropped runtime can
 // go away while the scheduler waits.
 async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
+    let mut failing = false;
+
     loop {
         let next = {
             let Some(strong) = inner.upgrade() else {
@@ -389,6 +402,14 @@ async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
 
             spawn_due(&strong, &index)
         };
+
+        if let Err(e) = &next
+            && !failing
+        {
+            tracing::warn!("cannot read the alarm index, alarms wait: {e}");
+        }
+
+        failing = next.is_err();
 
         let wait = match next {
             Ok(Some(at)) => Duration::from_millis((at - alarm::now_ms()).max(0).cast_unsigned()),
@@ -453,3 +474,6 @@ async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8
 
     index.delivered(&key);
 }
+
+#[cfg(test)]
+mod tests;

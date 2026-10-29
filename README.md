@@ -99,6 +99,9 @@ of the alarms for the scheduler. An entry is never later than the alarm in
 the file, so a crash between the two writes wakes an object early. The object
 then checks its file and does nothing.
 
+If a read of the index fails, the scheduler logs one WARN through `tracing`
+and reads the index again after 1 s, until a read succeeds.
+
 ## Limits
 
 - One node. There is no replication.

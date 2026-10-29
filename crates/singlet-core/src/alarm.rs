@@ -20,6 +20,9 @@ pub(crate) struct Index {
     conn: Mutex<Connection>,
     delivering: Mutex<HashSet<Vec<u8>>>,
     pub(crate) wake: Notify,
+    // The next reads of the index fail while this is above zero.
+    #[cfg(test)]
+    pub(crate) fail_reads: std::sync::atomic::AtomicU32,
 }
 
 impl Index {
@@ -34,6 +37,8 @@ impl Index {
             conn: Mutex::new(conn),
             delivering: Mutex::default(),
             wake: Notify::new(),
+            #[cfg(test)]
+            fail_reads: Default::default(),
         })
     }
 
@@ -75,6 +80,9 @@ impl Index {
     /// Returns the keys due at `now` that no task delivers, and marks them
     /// as delivering.
     pub(crate) fn take_due(&self, now: i64) -> Result<Vec<Vec<u8>>, Error> {
+        #[cfg(test)]
+        self.fail_read()?;
+
         let due: Vec<Vec<u8>> = self
             .conn
             .lock()
@@ -105,6 +113,23 @@ impl Index {
     pub(crate) fn delivered(&self, key: &[u8]) {
         self.delivering.lock().unwrap().remove(key);
         self.wake.notify_one();
+    }
+
+    #[cfg(test)]
+    fn fail_read(&self) -> Result<(), Error> {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        if self
+            .fail_reads
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let io = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR);
+
+        Err(Error::Storage(rusqlite::Error::SqliteFailure(io, None)))
     }
 }
 
