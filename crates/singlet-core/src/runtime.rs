@@ -43,6 +43,14 @@ impl<A: Actor> Clone for Runtime<A> {
     }
 }
 
+impl<A: Actor> std::fmt::Debug for Runtime<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("options", &self.inner.options)
+            .finish_non_exhaustive()
+    }
+}
+
 type Make<A> = Box<dyn Fn(&<A as Actor>::Key) -> A + Send + Sync>;
 
 struct Inner<A: Actor> {

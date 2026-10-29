@@ -4,6 +4,8 @@
 //! instance on the first call and stops it after a time without calls. Calls
 //! for one key run one at a time, in order.
 
+#![warn(missing_docs)]
+
 mod alarm;
 mod ctx;
 mod db;
@@ -29,10 +31,15 @@ struct ReadmeDoctests;
 /// returns `Err` discards its writes and the instance, so memory and storage
 /// stay in step.
 pub trait Actor: Send + 'static {
+    /// The identity of an instance.
     type Key: Key;
+    /// The input of [`Actor::handle`].
     type Msg: Send + 'static;
+    /// The output of [`Actor::handle`].
     type Reply: Send + 'static;
 
+    /// Runs one call. The runtime gives no other call of this key to the
+    /// instance until this future completes.
     fn handle(
         &mut self,
         ctx: &mut Ctx,

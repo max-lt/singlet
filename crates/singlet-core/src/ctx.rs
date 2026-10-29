@@ -25,6 +25,12 @@ pub struct Ctx {
     alarm: Option<Option<i64>>,
 }
 
+impl std::fmt::Debug for Ctx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ctx").finish_non_exhaustive()
+    }
+}
+
 impl Ctx {
     pub(crate) fn open(dir: &Path, key: Vec<u8>, index: Arc<Index>) -> Result<Self, Error> {
         let name: String = Sha256::digest(&key)
@@ -51,6 +57,7 @@ impl Ctx {
         self.conn.as_ref().expect("commit puts the connection back")
     }
 
+    /// Returns the value of `key`, or `None` if the key has no value.
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
         let value = self
             .conn()
@@ -61,6 +68,7 @@ impl Ctx {
         Ok(value)
     }
 
+    /// Sets the value of `key`.
     pub fn put(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
         self.begin()?;
         self.conn()
@@ -70,6 +78,7 @@ impl Ctx {
         Ok(())
     }
 
+    /// Removes `key` and its value.
     pub fn delete(&mut self, key: &str) -> Result<(), Error> {
         self.begin()?;
         self.conn()
@@ -79,6 +88,7 @@ impl Ctx {
         Ok(())
     }
 
+    /// Returns the time of the alarm, or `None` if no alarm is set.
     pub fn alarm(&self) -> Result<Option<SystemTime>, Error> {
         Ok(self.alarm_ms()?.map(alarm::from_ms))
     }
@@ -99,6 +109,7 @@ impl Ctx {
         Ok(())
     }
 
+    /// Removes the alarm.
     pub fn delete_alarm(&mut self) -> Result<(), Error> {
         self.begin()?;
         self.conn()

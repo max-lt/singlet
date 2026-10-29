@@ -1,11 +1,18 @@
+/// An error of the runtime or of an instance.
+///
+/// An error from [`Runtime::call`](crate::Runtime::call) means that the turn
+/// did not commit.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("storage: {0}")]
+    /// A SQLite operation failed.
+    #[error(transparent)]
     Storage(#[from] rusqlite::Error),
 
-    #[error("io: {0}")]
+    /// A file operation on the data directory failed.
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// Another runtime holds the lock of the data directory.
     #[error("data directory is in use by another runtime")]
     Locked,
 
@@ -21,12 +28,13 @@ pub enum Error {
     #[error("runtime is shut down")]
     Closed,
 
-    /// The instance panicked during the call. The turn did not commit.
+    /// The instance panicked during the turn. The turn did not commit.
     #[error("instance stopped before it replied")]
     Stopped,
 
-    /// From [`Actor::handle`](crate::Actor::handle). The turn did not commit.
-    /// The caller gets the error of the actor back with `downcast_ref`.
-    #[error("{0}")]
+    /// From [`Actor::handle`](crate::Actor::handle) or
+    /// [`Actor::alarm`](crate::Actor::alarm). The turn did not commit. The
+    /// caller gets the error of the actor back with `downcast_ref`.
+    #[error(transparent)]
     Actor(Box<dyn std::error::Error + Send + Sync>),
 }
