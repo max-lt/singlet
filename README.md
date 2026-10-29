@@ -79,8 +79,10 @@ cargo run --example stock
   wait in the mailbox go to the new instance.
 - `Runtime::open` must run inside a Tokio runtime.
 - One runtime owns its data directory. A second runtime on the same directory
-  fails with `Error::Locked`, also from another process. The lock stays until
-  the last instance stops.
+  fails with `Error::Locked`, also from another process.
+- `Runtime::shutdown` runs the calls that wait, then releases the lock. After
+  it, a call fails with `Error::Closed`. If the runtime drops with no
+  shutdown, the lock stays until the last instance stops.
 
 ## Storage
 
@@ -101,8 +103,8 @@ then checks its file and does nothing.
 ## Fuzzing
 
 The `runtime` target checks each reply against a model, with calls, bursts,
-alarms and pauses near the idle time. At the end, it reopens the directory
-and checks the stored counts and which keys fired an alarm.
+alarms, restarts and pauses near the idle time. At the end, it reopens the
+directory and checks the stored counts and which keys fired an alarm.
 
 ```sh
 just fuzz       # 300 s

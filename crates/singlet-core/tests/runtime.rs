@@ -1,3 +1,5 @@
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use singlet_core::Actor;
@@ -5,6 +7,7 @@ use singlet_core::Ctx;
 use singlet_core::Error;
 use singlet_core::Options;
 use singlet_core::Runtime;
+use tokio::sync::oneshot;
 
 const IDLE: Duration = Duration::from_millis(50);
 
@@ -13,7 +16,11 @@ enum Cmd {
     Get,
     Fail,
     Panic,
-    Slow,
+    /// Holds the instance until `release`.
+    Wait {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -57,8 +64,9 @@ impl Actor for Counter {
                 return Err(Error::Actor(Box::new(Refused(7))));
             }
             Cmd::Panic => panic!("panic"),
-            Cmd::Slow => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            Cmd::Wait { started, release } => {
+                started.send(()).ok();
+                release.await.ok();
                 n
             }
         };
@@ -86,6 +94,36 @@ fn open(dir: &tempfile::TempDir) -> Runtime<Counter> {
 
 fn count(stored: u64, served: u64) -> Count {
     Count { stored, served }
+}
+
+async fn poll_once<F: Future>(mut call: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await
+}
+
+/// Polls `call` once, so it is in the mailbox when this returns.
+async fn enqueue<F: Future>(call: Pin<&mut F>) {
+    assert!(poll_once(call).await.is_pending());
+}
+
+/// Sends a call that holds the instance of `key`, and returns once it runs.
+async fn hold(rt: &Runtime<Counter>, key: &str) -> oneshot::Sender<()> {
+    let (started, running) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    let rt = rt.clone();
+    let key = key.to_owned();
+
+    tokio::spawn(async move {
+        let cmd = Cmd::Wait {
+            started,
+            release: wait,
+        };
+
+        rt.call(&key, cmd).await.unwrap();
+    });
+
+    running.await.unwrap();
+
+    release
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -128,9 +166,7 @@ async fn storage_outlives_the_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let rt = open(&dir);
     rt.call("room", Cmd::Inc).await.unwrap();
-    drop(rt);
-
-    tokio::time::sleep(IDLE * 4).await;
+    rt.shutdown().await;
 
     let rt = open(&dir);
     assert_eq!(rt.call("room", Cmd::Inc).await.unwrap(), count(2, 1));
@@ -163,21 +199,14 @@ async fn a_panic_stops_only_its_call() {
     assert_eq!(rt.call("room", Cmd::Inc).await.unwrap(), count(2, 1));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn keys_run_in_parallel() {
+#[tokio::test]
+async fn a_waiting_turn_does_not_hold_other_keys() {
     let dir = tempfile::tempdir().unwrap();
     let rt = open(&dir);
+    let _release = hold(&rt, "a").await;
 
-    let slow = {
-        let rt = rt.clone();
-        tokio::spawn(async move { rt.call("a", Cmd::Slow).await })
-    };
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let fast = tokio::time::timeout(Duration::from_millis(500), rt.call("b", Cmd::Inc)).await;
-    assert_eq!(fast.unwrap().unwrap(), count(1, 1));
-    assert!(!slow.is_finished());
+    let b = tokio::time::timeout(Duration::from_secs(5), rt.call("b", Cmd::Inc)).await;
+    assert_eq!(b.unwrap().unwrap(), count(1, 1));
 }
 
 #[tokio::test]
@@ -205,31 +234,60 @@ async fn a_full_mailbox_refuses_the_call() {
         ..Options::default()
     };
     let rt = Runtime::open(dir.path(), options, |_| Counter::default()).unwrap();
+    let release = hold(&rt, "room").await;
 
-    let slow = {
-        let rt = rt.clone();
-        tokio::spawn(async move { rt.call("room", Cmd::Slow).await })
-    };
+    let mut waiting = [
+        Box::pin(rt.call("room", Cmd::Inc)),
+        Box::pin(rt.call("room", Cmd::Inc)),
+    ];
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let waiting: Vec<_> = (0..2)
-        .map(|_| {
-            let rt = rt.clone();
-            tokio::spawn(async move { rt.call("room", Cmd::Inc).await })
-        })
-        .collect();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for call in &mut waiting {
+        enqueue(call.as_mut()).await;
+    }
 
     assert!(matches!(
         rt.call("room", Cmd::Inc).await,
         Err(Error::Overloaded)
     ));
 
-    slow.await.unwrap().unwrap();
+    release.send(()).unwrap();
 
-    for call in waiting {
-        call.await.unwrap().unwrap();
+    for (call, n) in waiting.into_iter().zip(1..) {
+        assert_eq!(call.await.unwrap().stored, n);
     }
+}
+
+#[tokio::test]
+async fn shutdown_runs_the_waiting_calls_and_releases_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = open(&dir);
+    let release = hold(&rt, "room").await;
+
+    let mut waiting = [
+        Box::pin(rt.call("room", Cmd::Inc)),
+        Box::pin(rt.call("room", Cmd::Inc)),
+    ];
+
+    for call in &mut waiting {
+        enqueue(call.as_mut()).await;
+    }
+
+    release.send(()).unwrap();
+    rt.shutdown().await;
+
+    for (call, n) in waiting.iter_mut().zip(1..) {
+        let Poll::Ready(reply) = poll_once(call.as_mut()).await else {
+            panic!("shutdown returns after the waiting calls");
+        };
+
+        assert_eq!(reply.unwrap().stored, n);
+    }
+
+    assert!(matches!(
+        rt.call("room", Cmd::Inc).await,
+        Err(Error::Closed)
+    ));
+
+    let rt = open(&dir);
+    assert_eq!(rt.call("room", Cmd::Get).await.unwrap(), count(2, 1));
 }

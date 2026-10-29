@@ -29,8 +29,8 @@ const INDEX_RETRY: Duration = Duration::from_secs(1);
 ///
 /// One runtime owns its data directory; a second `open` on the same
 /// directory fails with [`Error::Locked`], even from another process. The
-/// lock stays until the last instance stops, which can be
-/// [`Options::idle`] after the runtime drops.
+/// lock stays until [`Runtime::shutdown`] returns, or until the last
+/// instance stops after the runtime drops.
 pub struct Runtime<A: Actor> {
     inner: Arc<Inner<A>>,
 }
@@ -51,7 +51,9 @@ struct Inner<A: Actor> {
     make: Make<A>,
     registry: Mutex<Registry<A>>,
     index: Arc<Index>,
-    _lock: File,
+    // Ends when every instance has stopped after a shutdown.
+    stopped: Mutex<Option<mpsc::Receiver<()>>>,
+    lock: Mutex<Option<File>>,
 }
 
 impl<A: Actor> Drop for Inner<A> {
@@ -64,6 +66,8 @@ impl<A: Actor> Drop for Inner<A> {
 struct Registry<A: Actor> {
     entries: HashMap<A::Key, Entry<A>>,
     next_id: u64,
+    // Each instance holds a clone. None after a shutdown.
+    alive: Option<mpsc::Sender<()>>,
 }
 
 struct Entry<A: Actor> {
@@ -112,6 +116,7 @@ impl<A: Actor> Runtime<A> {
         }
 
         let index = Arc::new(Index::open(&dir.join("alarms.sqlite"))?);
+        let (alive, stopped) = mpsc::channel(1);
 
         let inner = Arc::new(Inner {
             objects,
@@ -120,9 +125,11 @@ impl<A: Actor> Runtime<A> {
             registry: Mutex::new(Registry {
                 entries: HashMap::new(),
                 next_id: 0,
+                alive: Some(alive),
             }),
             index: index.clone(),
-            _lock: lock,
+            stopped: Mutex::new(Some(stopped)),
+            lock: Mutex::new(Some(lock)),
         });
 
         tokio::spawn(schedule(Arc::downgrade(&inner), index));
@@ -151,6 +158,30 @@ impl<A: Actor> Runtime<A> {
         }
     }
 
+    /// Stops the runtime and releases the lock of its data directory.
+    ///
+    /// New calls fail with [`Error::Closed`], also through the clones of this
+    /// runtime. The calls that wait still run. The alarms stay in storage for
+    /// the next runtime.
+    pub async fn shutdown(&self) {
+        let stopped = {
+            let mut registry = self.inner.registry.lock().unwrap();
+            registry.entries.clear();
+            registry.alive = None;
+
+            self.inner.stopped.lock().unwrap().take()
+        };
+
+        self.inner.index.wake.notify_one();
+
+        let Some(mut stopped) = stopped else {
+            return;
+        };
+
+        stopped.recv().await;
+        self.inner.lock.lock().unwrap().take();
+    }
+
     async fn alarm(&self, key: &A::Key, on_failure: OnFailure) -> Result<(), Error> {
         let (done, rx) = oneshot::channel();
         self.send(key, Job::Alarm(on_failure, done))?;
@@ -177,6 +208,10 @@ impl<A: Actor> Runtime<A> {
             };
         }
 
+        let Some(alive) = registry.alive.clone() else {
+            return Err(Error::Closed);
+        };
+
         let id = registry.next_id;
         registry.next_id += 1;
 
@@ -190,6 +225,7 @@ impl<A: Actor> Runtime<A> {
             id,
             rx,
             inner: self.inner.clone(),
+            _alive: alive,
         };
 
         tokio::spawn(run(mailbox));
@@ -206,6 +242,7 @@ struct Mailbox<A: Actor> {
     id: u64,
     rx: mpsc::Receiver<Job<A>>,
     inner: Arc<Inner<A>>,
+    _alive: mpsc::Sender<()>,
 }
 
 impl<A: Actor> Mailbox<A> {
@@ -272,7 +309,9 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
 
     loop {
         let job = match tokio::time::timeout(inner.options.idle, mailbox.rx.recv()).await {
-            Ok(job) => job.expect("the entry holds a sender"),
+            Ok(Some(job)) => job,
+            // A shutdown removed the entry, and the mailbox is empty.
+            Ok(None) => return,
             Err(_) if mailbox.retire() => return,
             Err(_) => continue,
         };
@@ -336,6 +375,10 @@ async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
                 return;
             };
 
+            if strong.registry.lock().unwrap().alive.is_none() {
+                return;
+            }
+
             spawn_due(&strong, &index)
         };
 
@@ -389,13 +432,10 @@ async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8
             OnFailure::Drop
         };
 
-        let ok = (Runtime { inner })
-            .alarm(&decoded, on_failure)
-            .await
-            .is_ok();
-
-        if ok || on_failure == OnFailure::Drop {
-            break;
+        match (Runtime { inner }).alarm(&decoded, on_failure).await {
+            Ok(()) | Err(Error::Closed) => break,
+            Err(_) if on_failure == OnFailure::Drop => break,
+            Err(_) => {}
         }
 
         let backoff = alarm_backoff.saturating_mul(1 << failures.min(16));

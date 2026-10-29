@@ -13,6 +13,10 @@ pub enum Error {
     #[error("too many calls wait for this key")]
     Overloaded,
 
+    /// The runtime is shut down. The call did not run.
+    #[error("runtime is shut down")]
+    Closed,
+
     /// The instance panicked during the call. The turn did not commit.
     #[error("instance stopped before it replied")]
     Stopped,

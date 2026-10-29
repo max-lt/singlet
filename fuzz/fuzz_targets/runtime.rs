@@ -1,6 +1,6 @@
-//! Runs random calls, bursts, alarms and pauses against a counter per key,
-//! and checks every reply against a model. The pauses are near the idle
-//! time, so instances stop while calls and alarms arrive.
+//! Runs random calls, bursts, alarms, pauses and restarts against a counter
+//! per key, and checks every reply against a model. The pauses are near the
+//! idle time, so instances stop while calls and alarms arrive.
 
 #![no_main]
 
@@ -49,6 +49,7 @@ enum Op {
     Call { key: u8, cmd: Cmd },
     Burst { key: u8, n: u8 },
     Sleep { ms: u8 },
+    Restart,
 }
 
 // A panic aborts the fuzzer, so the counter has no panic command.
@@ -119,7 +120,7 @@ fuzz_target!(|ops: Vec<Op>| {
 
 async fn check(ops: Vec<Op>) {
     let dir = tempfile::tempdir().unwrap();
-    let rt = open(dir.path()).unwrap();
+    let mut rt = open(dir.path()).unwrap();
     let mut model = [0u64; KEYS as usize];
     let mut armed = [false; KEYS as usize];
 
@@ -171,19 +172,15 @@ async fn check(ops: Vec<Op>) {
             Op::Sleep { ms } => {
                 tokio::time::sleep(Duration::from_millis(u64::from(ms % 5))).await;
             }
+            Op::Restart => {
+                rt.shutdown().await;
+                rt = open(dir.path()).unwrap();
+            }
         }
     }
 
-    drop(rt);
-
-    // The lock goes when the last instance stops.
-    let rt = loop {
-        match open(dir.path()) {
-            Ok(rt) => break rt,
-            Err(Error::Locked) => tokio::time::sleep(IDLE).await,
-            Err(e) => panic!("{e}"),
-        }
-    };
+    rt.shutdown().await;
+    let rt = open(dir.path()).unwrap();
 
     let deadline = Instant::now() + ALARM_DEADLINE;
 

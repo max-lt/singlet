@@ -86,16 +86,6 @@ fn open(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Result<Runtime
     )
 }
 
-async fn reopen(dir: &tempfile::TempDir, failures: &'static AtomicU32) -> Runtime<Clock> {
-    loop {
-        match open(dir, failures) {
-            Ok(rt) => return rt,
-            Err(Error::Locked) => tokio::time::sleep(IDLE).await,
-            Err(e) => panic!("{e}"),
-        }
-    }
-}
-
 const MS: fn(u64) -> Duration = Duration::from_millis;
 
 #[tokio::test]
@@ -118,9 +108,9 @@ async fn an_alarm_survives_a_restart() {
     let rt = open(&dir, &FAILURES).unwrap();
 
     rt.call("job", Cmd::Arm(MS(400))).await.unwrap();
-    drop(rt);
+    rt.shutdown().await;
 
-    let rt = reopen(&dir, &FAILURES).await;
+    let rt = open(&dir, &FAILURES).unwrap();
 
     tokio::time::sleep(MS(600)).await;
     assert_eq!(rt.call("job", Cmd::Fired).await.unwrap(), 1);
@@ -133,14 +123,14 @@ async fn an_alarm_due_while_no_runtime_runs_fires_on_open() {
     let rt = open(&dir, &FAILURES).unwrap();
 
     rt.call("job", Cmd::Arm(MS(300))).await.unwrap();
-    drop(rt);
+    rt.shutdown().await;
 
-    // The lock is free, so no runtime runs when the alarm comes due.
+    // No runtime runs when the alarm comes due.
     tokio::time::sleep(MS(200)).await;
-    drop(open(&dir, &FAILURES).unwrap());
+    open(&dir, &FAILURES).unwrap().shutdown().await;
     tokio::time::sleep(MS(300)).await;
 
-    let rt = reopen(&dir, &FAILURES).await;
+    let rt = open(&dir, &FAILURES).unwrap();
 
     tokio::time::sleep(MS(200)).await;
     assert_eq!(rt.call("job", Cmd::Fired).await.unwrap(), 1);
