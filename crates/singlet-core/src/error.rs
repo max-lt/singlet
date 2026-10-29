@@ -35,7 +35,7 @@ pub enum Error {
 
     /// From [`Runtime::shutdown`](crate::Runtime::shutdown) after its
     /// deadline.
-    #[error("shutdown aborted {aborted} turns, {running} instances still run")]
+    #[error("shutdown deadline passed: aborted turns {aborted}, running instances {running}")]
     Deadline {
         /// The turns that the shutdown aborted. They did not commit.
         aborted: usize,

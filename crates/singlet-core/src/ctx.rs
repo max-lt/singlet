@@ -22,6 +22,7 @@ pub struct Ctx {
     key: Vec<u8>,
     index: Arc<Index>,
     writing: bool,
+    // The alarm write of this turn: None leaves the alarm, Some(None) deletes it.
     alarm: Option<Option<i64>>,
 }
 

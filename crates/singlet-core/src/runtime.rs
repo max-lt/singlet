@@ -127,7 +127,8 @@ enum OnFailure {
 
 enum Response<A: Actor> {
     Done(Result<A::Reply, Error>),
-    Retry(A::Msg),
+    // The call did not begin.
+    Resend(A::Msg),
 }
 
 impl<A: Actor> Runtime<A> {
@@ -195,7 +196,7 @@ impl<A: Actor> Runtime<A> {
 
             match rx.await {
                 Ok(Response::Done(result)) => return result,
-                Ok(Response::Retry(m)) => msg = m,
+                Ok(Response::Resend(m)) => msg = m,
                 Err(_) => return Err(Error::Stopped),
             }
         }
@@ -350,7 +351,7 @@ impl<A: Actor> Mailbox<A> {
     }
 
     /// Removes the entry if no call is waiting.
-    fn retire(&mut self) -> bool {
+    fn retire(&self) -> bool {
         let mut registry = self.inner.registry.lock().unwrap();
 
         if !self.rx.is_empty() {
@@ -372,7 +373,7 @@ impl<A: Actor> Drop for Mailbox<A> {
 
         while let Ok(job) = self.rx.try_recv() {
             if let Job::Call(msg, reply) = job {
-                reply.send(Response::Retry(msg)).ok();
+                reply.send(Response::Resend(msg)).ok();
             }
         }
 
@@ -417,8 +418,8 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
 }
 
 async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mut Ctx) {
-    let inner = mailbox.inner.clone();
-    let control = mailbox.control.clone();
+    let inner = &mailbox.inner;
+    let control = &mailbox.control;
 
     loop {
         let job = match tokio::time::timeout(inner.options.idle, mailbox.rx.recv()).await {
@@ -433,7 +434,7 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
             match job {
                 // The call did not begin, so the caller sends it again and
                 // gets Error::Closed.
-                Job::Call(msg, reply) => reply.send(Response::Retry(msg)).ok(),
+                Job::Call(msg, reply) => reply.send(Response::Resend(msg)).ok(),
                 Job::Alarm(_, done) => done.send(Err(Error::Closed)).ok(),
             };
 
@@ -442,7 +443,7 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
 
         let failed = match job {
             Job::Call(msg, reply) => {
-                let result = call_turn(actor, ctx, &control, msg).await;
+                let result = call_turn(actor, ctx, control, msg).await;
                 let failed = result.is_err();
 
                 if let Some(result) = inner.reply(result) {
@@ -452,7 +453,7 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
                 failed
             }
             Job::Alarm(on_failure, done) => {
-                let result = alarm_turn(actor, ctx, &control, on_failure).await;
+                let result = alarm_turn(actor, ctx, control, on_failure).await;
                 let failed = result.is_err();
 
                 if let Some(result) = inner.reply(result) {
