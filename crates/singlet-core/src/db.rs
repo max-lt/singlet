@@ -28,3 +28,23 @@ pub(crate) fn open(path: &Path, schema: &str) -> Result<Connection, Error> {
 
     Ok(conn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stop_between_the_tables_and_the_version_leaves_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.sqlite");
+
+        // The statement after the tables fails, as a crash at that point.
+        assert!(open(&path, "CREATE TABLE kv (k); SELECT no_such_function();").is_err());
+
+        let conn = open(&path, "CREATE TABLE kv (k);").unwrap();
+        let format: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(format, FORMAT);
+    }
+}
