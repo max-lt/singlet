@@ -33,6 +33,16 @@ let rt = Runtime::open("data", Duration::from_secs(60), |_key| Counter)?;
 let reply = rt.call("room-1", vec![]).await?;
 ```
 
+## Examples
+
+- `stock`: 50 buyers, 10 items, no overselling.
+- `invoices`: invoice numbers with no gap; a rejected invoice uses no number.
+- `rate_limit`: a token bucket per API key, in memory only.
+
+```sh
+cargo run --example stock
+```
+
 ## Rules
 
 - A runtime starts the instance of a key on the first call. It stops the
