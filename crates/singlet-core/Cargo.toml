@@ -1,0 +1,17 @@
+[package]
+name = "singlet-core"
+version = "0.1.0"
+description = "One instance per key, with its own SQLite storage"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
