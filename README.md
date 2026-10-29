@@ -113,6 +113,12 @@ and reads the index again after 1 s, until a read succeeds.
 
 - One node. There is no replication.
 - An `await` in `handle` blocks all calls for its key.
+- A call from `handle` to its own key waits for ever, as the instance runs
+  one turn at a time. A cycle of calls between keys waits for ever too. The
+  deadline of `Runtime::shutdown` aborts these turns.
+- Each running instance holds 3 file descriptors: its file, the WAL and the
+  shared memory. There is no limit on running instances. Above `ulimit -n`,
+  a call that starts an instance fails with `Error::Storage`.
 
 ## Fuzzing
 
