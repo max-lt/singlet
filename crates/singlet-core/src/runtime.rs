@@ -19,7 +19,9 @@ use crate::Key;
 /// Routes calls to one instance per key.
 ///
 /// One runtime owns its data directory; a second `open` on the same
-/// directory fails with [`Error::Locked`], even from another process.
+/// directory fails with [`Error::Locked`], even from another process. The
+/// lock stays until the last instance stops, which can be `idle` after the
+/// runtime drops.
 pub struct Runtime<A: Actor> {
     inner: Arc<Inner<A>>,
 }
@@ -38,7 +40,7 @@ struct Inner<A: Actor> {
     objects: PathBuf,
     idle: Duration,
     make: Make<A>,
-    registry: Arc<Mutex<Registry<A>>>,
+    registry: Mutex<Registry<A>>,
     _lock: File,
 }
 
@@ -87,10 +89,10 @@ impl<A: Actor> Runtime<A> {
                 objects,
                 idle,
                 make: Box::new(make),
-                registry: Arc::new(Mutex::new(Registry {
+                registry: Mutex::new(Registry {
                     entries: HashMap::new(),
                     next_id: 0,
-                })),
+                }),
                 _lock: lock,
             }),
         })
@@ -144,10 +146,10 @@ impl<A: Actor> Runtime<A> {
             key,
             id,
             rx,
-            registry: self.inner.registry.clone(),
+            inner: self.inner.clone(),
         };
 
-        tokio::spawn(run(self.inner.clone(), mailbox));
+        tokio::spawn(run(mailbox));
     }
 }
 
@@ -158,7 +160,7 @@ struct Mailbox<A: Actor> {
     key: A::Key,
     id: u64,
     rx: mpsc::UnboundedReceiver<Envelope<A>>,
-    registry: Arc<Mutex<Registry<A>>>,
+    inner: Arc<Inner<A>>,
 }
 
 impl<A: Actor> Mailbox<A> {
@@ -174,7 +176,7 @@ impl<A: Actor> Mailbox<A> {
 
     /// Removes the entry if no call is waiting.
     fn retire(&mut self) -> bool {
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = self.inner.registry.lock().unwrap();
 
         if !self.rx.is_empty() {
             return false;
@@ -188,11 +190,9 @@ impl<A: Actor> Mailbox<A> {
 
 impl<A: Actor> Drop for Mailbox<A> {
     fn drop(&mut self) {
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = self.inner.registry.lock().unwrap();
         self.remove_entry(&mut registry);
         drop(registry);
-
-        self.rx.close();
 
         while let Ok(env) = self.rx.try_recv() {
             env.reply.send(Response::Retry(env.msg)).ok();
@@ -202,15 +202,17 @@ impl<A: Actor> Drop for Mailbox<A> {
 
 // The mailbox drops after the locals of serve, so the storage of this
 // instance is closed before a new instance of the key can open it.
-async fn run<A: Actor>(inner: Arc<Inner<A>>, mut mailbox: Mailbox<A>) {
-    serve(&inner, &mut mailbox).await;
+async fn run<A: Actor>(mut mailbox: Mailbox<A>) {
+    serve(&mut mailbox).await;
 }
 
-async fn serve<A: Actor>(inner: &Inner<A>, mailbox: &mut Mailbox<A>) {
+async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
+    let inner = mailbox.inner.clone();
+
     let mut ctx = match Ctx::open(&inner.objects, &mailbox.key.encode()) {
         Ok(ctx) => ctx,
         Err(e) => {
-            let env = mailbox.rx.try_recv().unwrap();
+            let env = mailbox.rx.try_recv().expect("send puts the first call in");
             env.reply.send(Response::Done(Err(e))).ok();
 
             return;

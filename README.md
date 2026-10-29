@@ -62,7 +62,8 @@ cargo run --example stock
 - A panic stops the instance. Its caller gets `Error::Stopped`. Calls that
   wait in the mailbox go to the new instance.
 - One runtime owns its data directory. A second runtime on the same directory
-  fails with `Error::Locked`, also from another process.
+  fails with `Error::Locked`, also from another process. The lock stays until
+  the last instance stops.
 
 ## Storage
 

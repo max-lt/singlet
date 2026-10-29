@@ -9,9 +9,11 @@ pub enum Error {
     #[error("data directory is in use by another runtime")]
     Locked,
 
+    /// The instance panicked during the call. The turn did not commit.
     #[error("instance stopped before it replied")]
     Stopped,
 
+    /// From [`Actor::handle`](crate::Actor::handle). The turn did not commit.
     #[error("{0}")]
     Actor(String),
 }
