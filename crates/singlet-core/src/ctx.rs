@@ -130,9 +130,16 @@ impl Ctx {
         Ok(at)
     }
 
-    /// Makes the index entry of this object equal to its alarm.
-    pub(crate) fn sync_index(&self) -> Result<(), Error> {
-        self.index.set(&self.key, self.alarm_ms()?)
+    /// Makes the index entry of this object equal to its alarm. Runs on a
+    /// blocking thread, as it waits for fsync.
+    pub(crate) async fn sync_index(&mut self) -> Result<(), Error> {
+        let at = self.alarm_ms()?;
+        let index = self.index.clone();
+        let key = self.key.clone();
+
+        tokio::task::spawn_blocking(move || index.set(&key, at))
+            .await
+            .expect("the index write does not panic")
     }
 
     /// Discards the writes of the turn.

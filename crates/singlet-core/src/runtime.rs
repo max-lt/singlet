@@ -329,8 +329,7 @@ impl<A: Actor> Runtime<A> {
 }
 
 /// Removes its entry and sends back the calls it did not serve when it
-/// drops, also on a panic. A new instance of the key can start only after
-/// that.
+/// drops, also on a panic.
 struct Mailbox<A: Actor> {
     key: A::Key,
     id: u64,
@@ -381,17 +380,25 @@ impl<A: Actor> Drop for Mailbox<A> {
     }
 }
 
-// The mailbox drops after the locals of serve, so the storage of this
-// instance is closed before a new instance of the key can open it.
+// The mailbox drops after serve returns: a failed turn has rolled back
+// before a new instance of the key starts, and the file is closed before
+// shutdown counts the instance as stopped.
 async fn run<A: Actor>(mut mailbox: Mailbox<A>) {
     serve(&mut mailbox).await;
 }
 
+// The open of a new file and the close of a file that has writes wait for
+// fsync, so they run on a blocking thread.
 async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
-    let inner = mailbox.inner.clone();
-    let control = mailbox.control.clone();
+    let objects = mailbox.inner.objects.clone();
+    let key = mailbox.key.encode();
+    let index = mailbox.inner.index.clone();
 
-    let mut ctx = match Ctx::open(&inner.objects, mailbox.key.encode(), inner.index.clone()) {
+    let opened = tokio::task::spawn_blocking(move || Ctx::open(&objects, key, index))
+        .await
+        .expect("open does not panic");
+
+    let mut ctx = match opened {
         Ok(ctx) => ctx,
         Err(e) => {
             match mailbox.rx.try_recv().expect("send puts the first job in") {
@@ -403,7 +410,15 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
         }
     };
 
-    let mut actor = (inner.make)(&mailbox.key);
+    let mut actor = (mailbox.inner.make)(&mailbox.key);
+    serve_turns(mailbox, &mut actor, &mut ctx).await;
+
+    tokio::task::spawn_blocking(move || drop(ctx)).await.ok();
+}
+
+async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mut Ctx) {
+    let inner = mailbox.inner.clone();
+    let control = mailbox.control.clone();
 
     loop {
         let job = match tokio::time::timeout(inner.options.idle, mailbox.rx.recv()).await {
@@ -427,7 +442,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
 
         let failed = match job {
             Job::Call(msg, reply) => {
-                let result = call_turn(&mut actor, &mut ctx, &control, msg).await;
+                let result = call_turn(actor, ctx, &control, msg).await;
                 let failed = result.is_err();
 
                 if let Some(result) = inner.reply(result) {
@@ -437,7 +452,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
                 failed
             }
             Job::Alarm(on_failure, done) => {
-                let result = alarm_turn(&mut actor, &mut ctx, &control, on_failure).await;
+                let result = alarm_turn(actor, ctx, &control, on_failure).await;
                 let failed = result.is_err();
 
                 if let Some(result) = inner.reply(result) {
@@ -474,7 +489,7 @@ async fn alarm_turn<A: Actor>(
 ) -> Result<(), TurnError> {
     // The index wakes an object early, never late; the file decides.
     let Some(at) = ctx.alarm_ms()?.filter(|&at| at <= alarm::now_ms()) else {
-        return Ok(ctx.sync_index()?);
+        return Ok(ctx.sync_index().await?);
     };
 
     ctx.delete_alarm()?;

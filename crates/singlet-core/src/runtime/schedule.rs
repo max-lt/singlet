@@ -16,7 +16,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub(super) const INDEX_RETRY: Duration = Duration::from_secs(1);
 
 // Holds the runtime only while it reads the index, so a dropped runtime can
-// go away while the scheduler waits.
+// go away while the scheduler waits. The reads run on a blocking thread, as
+// a commit holds the index lock while it waits for fsync.
 pub(super) async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
     let mut failing = false;
 
@@ -30,7 +31,11 @@ pub(super) async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>)
                 return;
             }
 
-            spawn_due(&strong, &index)
+            let index = index.clone();
+
+            tokio::task::spawn_blocking(move || spawn_due(&strong, &index))
+                .await
+                .expect("the index read does not panic")
         };
 
         if let Err(e) = &next
