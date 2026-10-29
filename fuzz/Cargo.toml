@@ -1,0 +1,22 @@
+[package]
+name = "singlet-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+singlet-core = { path = "../crates/singlet-core" }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time"] }
+
+[[bin]]
+name = "runtime"
+path = "fuzz_targets/runtime.rs"
+test = false
+doc = false
+bench = false

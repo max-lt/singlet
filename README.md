@@ -77,6 +77,15 @@ crash of the process. It does not survive the loss of the disk.
 - A commit runs on the async thread of the instance.
 - An `await` in `handle` blocks all calls for its key.
 
+## Fuzzing
+
+The `runtime` target checks each reply against a model, with calls, bursts
+and pauses near the idle time.
+
+```sh
+cargo +nightly fuzz run runtime -- -max_len=512 -len_control=0
+```
+
 ## License
 
 MIT
