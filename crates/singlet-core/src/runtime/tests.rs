@@ -10,6 +10,8 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::layer::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
+use super::control::Point;
+use super::schedule::INDEX_RETRY;
 use super::*;
 
 const DEADLINE: Duration = Duration::from_millis(100);

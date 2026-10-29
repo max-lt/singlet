@@ -6,7 +6,6 @@ use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
@@ -26,9 +25,12 @@ use crate::Key;
 use crate::Options;
 use crate::alarm;
 use crate::alarm::Index;
+use control::Control;
+#[cfg(test)]
+use control::Gate;
+use control::TurnError;
+use schedule::schedule;
 
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const INDEX_RETRY: Duration = Duration::from_secs(1);
 const ABORT_WAIT: Duration = Duration::from_secs(1);
 
 /// Routes calls to one instance per key, and wakes instances for their
@@ -126,85 +128,6 @@ enum OnFailure {
 enum Response<A: Actor> {
     Done(Result<A::Reply, Error>),
     Retry(A::Msg),
-}
-
-enum TurnError {
-    Aborted,
-    Failed(Error),
-}
-
-impl From<Error> for TurnError {
-    fn from(e: Error) -> Self {
-        Self::Failed(e)
-    }
-}
-
-/// Lets a shutdown abort the turn of an instance, but not its commit.
-struct Control {
-    stop: AtomicBool,
-    // Holds its permit, so a turn that starts after the stop is aborted.
-    cancel: Notify,
-    #[cfg(test)]
-    gate: Option<Arc<Gate>>,
-}
-
-impl Control {
-    fn stopped(&self) -> bool {
-        self.stop.load(SeqCst)
-    }
-
-    fn stop(&self) {
-        self.stop.store(true, SeqCst);
-        self.cancel.notify_one();
-    }
-
-    /// Runs the code of the actor until it completes or a shutdown aborts
-    /// it. The abort drops the future at its next `await`.
-    async fn run<F: Future>(&self, code: F) -> Result<F::Output, TurnError> {
-        tokio::select! {
-            output = code => Ok(output),
-            () = self.cancel.notified() => Err(TurnError::Aborted),
-        }
-    }
-
-    async fn commit(&self, ctx: &mut Ctx) -> Result<(), TurnError> {
-        #[cfg(test)]
-        self.pass(Point::BeforeCommit).await;
-
-        // A stop after this read waits for the commit; the commit is not in
-        // run, so the cancel cannot reach it.
-        if self.stopped() {
-            return Err(TurnError::Aborted);
-        }
-
-        #[cfg(test)]
-        self.pass(Point::InCommit).await;
-
-        Ok(ctx.commit().await?)
-    }
-
-    #[cfg(test)]
-    async fn pass(&self, at: Point) {
-        if let Some(gate) = self.gate.as_ref().filter(|gate| gate.at == at) {
-            gate.reached.notify_one();
-            gate.open.notified().await;
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq)]
-enum Point {
-    BeforeCommit,
-    InCommit,
-}
-
-/// Holds an instance at a point of its commit, for the tests.
-#[cfg(test)]
-struct Gate {
-    at: Point,
-    reached: Notify,
-    open: Notify,
 }
 
 impl<A: Actor> Runtime<A> {
@@ -577,100 +500,7 @@ async fn alarm_turn<A: Actor>(
     result
 }
 
-// Holds the runtime only while it reads the index, so a dropped runtime can
-// go away while the scheduler waits.
-async fn schedule<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>) {
-    let mut failing = false;
-
-    loop {
-        let next = {
-            let Some(strong) = inner.upgrade() else {
-                return;
-            };
-
-            if strong.registry.lock().unwrap().closed {
-                return;
-            }
-
-            spawn_due(&strong, &index)
-        };
-
-        if let Err(e) = &next
-            && !failing
-        {
-            tracing::warn!("cannot read the alarm index, alarms wait: {e}");
-        }
-
-        failing = next.is_err();
-
-        let wait = match next {
-            Ok(Some(at)) => Duration::from_millis((at - alarm::now_ms()).max(0).cast_unsigned()),
-            Ok(None) => {
-                index.wake.notified().await;
-                continue;
-            }
-            // The index is a hint, so a failed read only delays the alarms.
-            Err(_) => INDEX_RETRY,
-        };
-
-        tokio::time::timeout(wait, index.wake.notified()).await.ok();
-    }
-}
-
-/// Starts a delivery for each due alarm, and returns the next alarm.
-fn spawn_due<A: Actor>(inner: &Arc<Inner<A>>, index: &Arc<Index>) -> Result<Option<i64>, Error> {
-    let now = alarm::now_ms();
-
-    for key in index.take_due(now)? {
-        tokio::spawn(deliver(Arc::downgrade(inner), index.clone(), key));
-    }
-
-    index.next_after(now)
-}
-
-async fn deliver<A: Actor>(inner: Weak<Inner<A>>, index: Arc<Index>, key: Vec<u8>) {
-    let mut failures = 0;
-
-    loop {
-        let Some(inner) = inner.upgrade() else {
-            break;
-        };
-
-        let Some(decoded) = A::Key::decode(&key) else {
-            index.set(&key, None).ok();
-            break;
-        };
-
-        let Options {
-            alarm_retries,
-            alarm_backoff,
-            ..
-        } = inner.options;
-
-        let on_failure = if failures < alarm_retries {
-            OnFailure::Retry
-        } else {
-            OnFailure::Drop
-        };
-
-        let rt = Runtime { inner };
-        let result = rt.alarm(&decoded, on_failure).await;
-
-        // A shutdown is not a failure of the alarm.
-        if result.is_ok()
-            || on_failure == OnFailure::Drop
-            || rt.inner.registry.lock().unwrap().closed
-        {
-            break;
-        }
-
-        let backoff = alarm_backoff.saturating_mul(1 << failures.min(16));
-        tokio::time::sleep(backoff.min(MAX_BACKOFF)).await;
-        failures += 1;
-    }
-
-    index.delivered(&key);
-}
-
+mod control;
+mod schedule;
 #[cfg(test)]
 mod tests;
