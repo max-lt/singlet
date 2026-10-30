@@ -128,8 +128,10 @@ and reads the index again after 1 s, until a read succeeds.
 ## Fuzzing
 
 The `runtime` target checks each reply against a model, with calls, bursts,
-alarms, restarts and pauses near the idle time. At the end, it reopens the
-directory and checks the stored counts and which keys fired an alarm.
+alarms, restarts, aborts and pauses near the idle time. An abort hangs a call
+or an alarm turn, and checks that a shutdown aborts it and discards its writes.
+At the end, it reopens the directory and checks the stored counts and which
+keys fired an alarm.
 
 ```sh
 just fuzz       # 300 s

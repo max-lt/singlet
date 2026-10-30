@@ -1,12 +1,14 @@
 //! Runs random calls, bursts, alarms, pauses and restarts against a counter
 //! per key, and checks every reply against a model. The pauses are near the
 //! idle time, so instances stop while calls and alarms arrive. MAX_LIVE is
-//! below KEYS, so a new key often stops an idle instance.
+//! below KEYS, so a new key often stops an idle instance. An abort hangs a
+//! call or an alarm turn, and a shutdown with a short deadline aborts it.
 
 #![no_main]
 
 use std::path::Path;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -18,6 +20,7 @@ use singlet_core::Ctx;
 use singlet_core::Error;
 use singlet_core::Options;
 use singlet_core::Runtime;
+use tokio::sync::Notify;
 
 const KEYS: u64 = 4;
 const MAX_LIVE: usize = 2;
@@ -25,6 +28,11 @@ const IDLE: Duration = Duration::from_millis(2);
 const MAX_BURST: u8 = 16;
 const ALARM_DEADLINE: Duration = Duration::from_secs(10);
 const DEADLINE: Duration = Duration::from_secs(10);
+const ABORT_DEADLINE: Duration = Duration::from_millis(5);
+
+// The key whose next alarm turn hangs.
+static HANG_ALARM: Mutex<Option<u64>> = Mutex::new(None);
+static HUNG: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 static TOKIO: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -45,6 +53,9 @@ enum Cmd {
     },
     Fired,
     Pending,
+    /// Writes the count and an alarm, then waits for ever: neither may stay.
+    #[arbitrary(skip)]
+    Hang,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -53,10 +64,13 @@ enum Op {
     Burst { key: u8, n: u8 },
     Sleep { ms: u8 },
     Restart,
+    Abort { key: u8, alarm: bool, queued: u8 },
 }
 
 // A panic aborts the fuzzer, so the counter has no panic command.
-struct Counter;
+struct Counter {
+    key: u64,
+}
 
 impl Actor for Counter {
     type Key = u64;
@@ -91,12 +105,35 @@ impl Actor for Counter {
             }
             Cmd::Fired => fired(ctx),
             Cmd::Pending => Ok(u64::from(ctx.alarm()?.is_some())),
+            Cmd::Hang => {
+                ctx.put("n", &u64::MAX.to_le_bytes())?;
+                ctx.set_alarm(SystemTime::now())?;
+
+                hang().await
+            }
         }
     }
 
     async fn alarm(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        if HANG_ALARM
+            .lock()
+            .unwrap()
+            .take_if(|key| *key == self.key)
+            .is_some()
+        {
+            ctx.put("n", &u64::MAX.to_le_bytes())?;
+
+            return hang().await;
+        }
+
         ctx.put("fired", &(fired(ctx)? + 1).to_le_bytes())
     }
+}
+
+async fn hang<T>() -> T {
+    HUNG.notify_one();
+
+    std::future::pending().await
 }
 
 fn fired(ctx: &Ctx) -> Result<u64, Error> {
@@ -114,7 +151,7 @@ fn open(dir: &Path) -> Result<Runtime<Counter>, Error> {
             max_live: MAX_LIVE,
             ..Options::default()
         },
-        |_| Counter,
+        |key| Counter { key: *key },
     )
 }
 
@@ -126,6 +163,12 @@ async fn call(rt: &Runtime<Counter>, key: u64, cmd: Cmd) -> Result<u64, Error> {
             reply => return reply,
         }
     }
+}
+
+fn spawn(rt: &Runtime<Counter>, key: u64, cmd: Cmd) -> tokio::task::JoinHandle<Result<u64, Error>> {
+    let rt = rt.clone();
+
+    tokio::spawn(async move { call(&rt, key, cmd).await })
 }
 
 fuzz_target!(|ops: Vec<Op>| {
@@ -159,6 +202,7 @@ async fn check(ops: Vec<Op>) {
                     Cmd::Fired | Cmd::Pending => {
                         reply.unwrap();
                     }
+                    Cmd::Hang => unreachable!("Op::Abort sends Cmd::Hang"),
                 }
             }
             Op::Burst { key, n } => {
@@ -188,6 +232,56 @@ async fn check(ops: Vec<Op>) {
             }
             Op::Restart => {
                 rt.shutdown(DEADLINE).await.unwrap();
+                rt = open(dir.path()).unwrap();
+            }
+            Op::Abort { key, alarm, queued } => {
+                let key = u64::from(key) % KEYS;
+                let count = model[key as usize];
+
+                // A due alarm of the key can hang before this call, so the
+                // call can wait behind it and get Closed.
+                let hung = if alarm {
+                    *HANG_ALARM.lock().unwrap() = Some(key);
+                    armed[key as usize] = true;
+
+                    spawn(&rt, key, Cmd::Arm { ms: 0 })
+                } else {
+                    spawn(&rt, key, Cmd::Hang)
+                };
+
+                tokio::time::timeout(DEADLINE, HUNG.notified())
+                    .await
+                    .expect("the turn hangs");
+
+                let waiting: Vec<_> = (0..queued % MAX_BURST)
+                    .map(|_| spawn(&rt, key, Cmd::Inc))
+                    .collect();
+
+                // An alarm turn of another key can reach its commit after the
+                // stop, so more than one turn can abort.
+                let shutdown = rt.shutdown(ABORT_DEADLINE).await;
+                assert!(
+                    matches!(
+                        shutdown,
+                        Err(Error::Deadline {
+                            aborted: 1..,
+                            running: 0
+                        })
+                    ),
+                    "{shutdown:?}"
+                );
+
+                match hung.await.unwrap() {
+                    Ok(reply) => assert!(alarm && reply == count),
+                    Err(Error::Stopped) => assert!(!alarm),
+                    Err(Error::Closed) => assert!(alarm),
+                    Err(e) => panic!("{e:?}"),
+                }
+
+                for call in waiting {
+                    assert!(matches!(call.await.unwrap(), Err(Error::Closed)));
+                }
+
                 rt = open(dir.path()).unwrap();
             }
         }
