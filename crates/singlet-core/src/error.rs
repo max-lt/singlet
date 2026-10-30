@@ -55,6 +55,10 @@ pub enum Error {
     /// From [`Actor::handle`](crate::Actor::handle) or
     /// [`Actor::alarm`](crate::Actor::alarm). The turn did not commit. The
     /// caller gets the error of the actor back with `downcast_ref`.
+    ///
+    /// When `handle` returns [`Error::Closed`], [`Error::Overloaded`] or
+    /// [`Error::Commit`], for example from a call to another runtime, the
+    /// caller gets it in this variant.
     #[error(transparent)]
     Actor(Box<dyn std::error::Error + Send + Sync>),
 }

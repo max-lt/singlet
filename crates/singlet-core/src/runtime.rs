@@ -564,10 +564,19 @@ async fn call_turn<A: Actor>(
     control: &Control,
     msg: A::Msg,
 ) -> Result<A::Reply, TurnError> {
-    let value = control.run(actor.handle(ctx, msg)).await??;
+    let value = control.run(actor.handle(ctx, msg)).await?.map_err(began)?;
     control.commit(ctx).await?;
 
     Ok(value)
+}
+
+// The turn began and did not commit, so an error that says otherwise comes
+// from a call of the actor to another runtime.
+fn began(e: Error) -> Error {
+    match e {
+        Error::Closed | Error::Overloaded | Error::Commit(_) => Error::Actor(Box::new(e)),
+        e => e,
+    }
 }
 
 async fn alarm_turn<A: Actor>(

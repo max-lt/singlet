@@ -16,6 +16,8 @@ enum Cmd {
     Inc,
     Get,
     Fail,
+    /// Fails with this error, as from a call to another runtime.
+    Return(Error),
     Panic,
     /// Holds the instance until `release`.
     Wait {
@@ -64,6 +66,7 @@ impl Actor for Counter {
 
                 return Err(Error::Actor(Box::new(Refused(7))));
             }
+            Cmd::Return(e) => return Err(e),
             Cmd::Panic => panic!("panic"),
             Cmd::Wait { started, release } => {
                 started.send(()).ok();
@@ -185,6 +188,28 @@ async fn a_failed_turn_discards_its_writes_and_the_instance() {
 
     assert_eq!(e.downcast_ref::<Refused>(), Some(&Refused(7)));
     assert_eq!(rt.call("room", Cmd::Get).await.unwrap(), count(1, 1));
+}
+
+// The turn began and did not commit, so an error that says otherwise does
+// not reach the caller as it is.
+#[tokio::test]
+async fn an_error_of_another_runtime_comes_as_an_actor_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = open(&dir);
+
+    for error in [
+        Error::Closed,
+        Error::Overloaded,
+        Error::Commit(rusqlite::Error::InvalidQuery),
+    ] {
+        let text = error.to_string();
+
+        let Err(Error::Actor(e)) = rt.call("room", Cmd::Return(error)).await else {
+            panic!("{text}: the turn must fail with Error::Actor");
+        };
+
+        assert_eq!(e.downcast_ref::<Error>().unwrap().to_string(), text);
+    }
 }
 
 #[tokio::test]
