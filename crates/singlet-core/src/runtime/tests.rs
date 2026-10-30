@@ -13,6 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use super::control::Point;
 use super::schedule::INDEX_RETRY;
 use super::*;
+use crate::Ctx;
 
 const DEADLINE: Duration = Duration::from_millis(100);
 
