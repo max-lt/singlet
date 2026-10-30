@@ -53,48 +53,79 @@ cargo run --example stock
 
 ## Rules
 
+### Instances
+
 - A runtime starts the instance of a key on the first call. It stops the
-  instance after the idle time with no calls.
-- `Msg` and `Reply` move in memory; there is no serialization.
+  instance after `Options::idle` (60 s) with no calls.
 - `Key::encode` names the storage file of a key. It must give different
   bytes for different keys, and the same bytes in every version.
+- `Msg` and `Reply` move in memory; there is no serialization.
+- `Options::max_live` (1024) instances run at once. To start one more, a
+  call stops an idle instance and waits for its slot. If every instance has
+  work, the call fails at once with `Error::Overloaded`.
+- `Runtime::open` must run inside a Tokio runtime.
+- One runtime owns its data directory. A second runtime on the same directory
+  fails with `Error::Locked`, also from another process.
+
+### Turns
+
 - One call to `handle` is a turn. Calls for one key do not interleave, also
   across an `await`. Calls for different keys run in parallel.
 - The writes of a turn commit when `handle` or `alarm` returns `Ok`, before
   the caller gets the reply.
-- An error from `call` means that the turn did not commit, so the caller can
-  send the call again. The exception is `Error::Commit`: the commit failed,
-  for example on fsync, and its writes can be on disk. Send that call again
-  only if it is safe to apply it two times.
 - A turn that returns `Err` discards its writes and the instance. The next
   call starts a new instance from storage.
+- A panic stops the instance. Calls that wait in the mailbox go to the new
+  instance.
+- Above `Options::mailbox` (1024) waiting calls for one key, a call fails at
+  once with `Error::Overloaded`.
+
+### Errors
+
+An error from `call` means that the turn did not commit, except
+`Error::Commit`.
+
+| Error                     | The turn             | Cause                                                      |
+| ------------------------- | -------------------- | ---------------------------------------------------------- |
+| `Actor`                   | began, not committed | `handle` returned `Err`                                    |
+| `Storage`, `Io`, `Format` | not committed        | a SQLite or file operation failed                          |
+| `Overloaded`              | did not begin        | the mailbox of the key is full, or every instance has work |
+| `Closed`                  | did not begin        | the runtime is shut down                                   |
+| `Stopped`                 | began, not committed | a panic, or an abort by `shutdown`                         |
+| `Commit`                  | may have committed   | the COMMIT failed, for example on fsync                    |
+
+Send the call again after an error, except `Commit`. After `Commit`, send it
+again only if it is safe to apply it two times.
+
+When `handle` returns `Closed`, `Overloaded` or `Commit`, for example from a
+call to another runtime, the caller gets it in `Error::Actor`.
+
+### Alarms
+
 - `ctx.set_alarm(at)` sets the one alarm of an instance. At `at`, the
   runtime runs `Actor::alarm` as a turn, also after a restart and also if
   the instance stopped. The alarm is cleared before that turn.
 - A failed alarm turn keeps the alarm. The runtime tries again after
-  `Options::alarm_backoff` (1 s), then doubles the wait up to 60 s, for
-  `Options::alarm_retries` (6) tries. The last try deletes the alarm before
-  it runs, so its failure drops the alarm. An alarm can run more than once.
-- Above `Options::mailbox` (1024) waiting calls for one key, a call fails at
-  once with `Error::Overloaded`.
-- `Options::max_live` (1024) instances run at once. To start one more, a
-  call stops an idle instance and waits for its slot. If every instance has
-  work, the call fails at once with `Error::Overloaded`.
-- A panic stops the instance. Its caller gets `Error::Stopped`. Calls that
-  wait in the mailbox go to the new instance.
-- `Runtime::open` must run inside a Tokio runtime.
-- One runtime owns its data directory. A second runtime on the same directory
-  fails with `Error::Locked`, also from another process.
+  `Options::alarm_backoff` (1 s), then doubles the wait up to 60 s. It tries
+  again `Options::alarm_retries` (6) times at most.
+- The last try deletes the alarm before it runs, so its failure drops the
+  alarm.
+- An alarm can run more than once.
+
+### Shutdown
+
 - `Runtime::shutdown(deadline)` runs the calls that wait until `deadline`.
-  Then it aborts each turn in `handle` or `alarm`; that turn does not commit,
-  and its caller gets `Error::Stopped`. A turn in its commit is not aborted.
-  A call that did not begin gets `Error::Closed`. An aborted alarm stays set.
+  New calls fail with `Error::Closed`.
+- After `deadline`, it aborts each turn in `handle` or `alarm`. That turn
+  does not commit, and its caller gets `Error::Stopped`. A turn in its
+  commit is not aborted. A call that did not begin gets `Error::Closed`.
+- An aborted alarm stays set, and the abort does not count as a try.
 - The abort takes effect at the next `await` of a turn. A turn with no
   `await` cannot be stopped.
-- After the abort, shutdown waits 1 s more. It releases the lock only when no
-  instance runs; else it returns `Error::Deadline` with `running` above 0 and
-  keeps the lock. If the runtime drops with no shutdown, the lock stays until
-  the last instance stops.
+- After the abort, shutdown waits 1 s more. It returns `Error::Deadline` if
+  it aborted a turn or if an instance still runs.
+- Shutdown releases the lock only when no instance runs. If the runtime
+  drops with no shutdown, the lock stays until the last instance stops.
 
 ## Storage
 
