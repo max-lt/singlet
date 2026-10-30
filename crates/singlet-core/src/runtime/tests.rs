@@ -27,6 +27,11 @@ enum Cmd {
     Get,
     /// Writes the count, then waits for ever.
     Hang,
+    /// Waits for `release` after a notify on `reached`, then fails.
+    Fail {
+        reached: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// Writes the count, sets `started`, then runs with no await while
     /// `spin` is set.
     Spin {
@@ -60,6 +65,12 @@ impl Actor for Clock {
             Cmd::Hang => {
                 ctx.put("n", &99u64.to_le_bytes())?;
                 std::future::pending::<()>().await;
+            }
+            Cmd::Fail { reached, release } => {
+                reached.notify_one();
+                release.notified().await;
+
+                return Err(Error::Actor("fail".into()));
             }
             Cmd::Spin { started, spin } => {
                 ctx.put("n", &99u64.to_le_bytes())?;
@@ -474,4 +485,59 @@ async fn an_aborted_alarm_with_retries_left_stays_armed() {
 #[tokio::test(start_paused = true)]
 async fn an_aborted_alarm_on_its_last_try_stays_armed() {
     an_aborted_alarm_stays_armed(0).await;
+}
+
+// Real time, as an alarm is due by SystemTime.
+#[tokio::test]
+async fn an_alarm_that_did_not_run_does_not_count_as_a_try() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        alarm_backoff: Duration::from_secs(3600),
+        ..Options::default()
+    };
+    let rt = Runtime::open(dir.path(), options, |_| Clock::default()).unwrap();
+    rt.call("job", Cmd::Arm(Duration::from_millis(200)))
+        .await
+        .unwrap();
+
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let failing = {
+        let rt = rt.clone();
+        let cmd = Cmd::Fail {
+            reached: reached.clone(),
+            release: release.clone(),
+        };
+
+        tokio::spawn(async move { rt.call("job", cmd).await })
+    };
+
+    reached.notified().await;
+
+    let queued = || {
+        let registry = rt.inner.registry.lock().unwrap();
+        let entry = &registry.entries["job"];
+
+        entry.tx.capacity() < entry.tx.max_capacity()
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+
+    while !queued() {
+        assert!(std::time::Instant::now() < deadline, "the alarm never came");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The failed turn stops the instance with the alarm in its mailbox.
+    release.notify_one();
+    assert!(failing.await.unwrap().is_err());
+
+    while rt.call("job", Cmd::Fired).await.unwrap() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the alarm waits for a backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

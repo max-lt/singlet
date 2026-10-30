@@ -129,10 +129,21 @@ enum Sent<A: Actor> {
     Wait(Job<A>),
 }
 
+// A dropped sender means that the turn began and did not commit.
 enum Job<A: Actor> {
-    Call(A::Msg, oneshot::Sender<Response<A>>),
-    // A dropped sender means the turn did not commit.
-    Alarm(OnFailure, oneshot::Sender<Result<(), Error>>),
+    Call(A::Msg, oneshot::Sender<Response<A::Reply, A::Msg>>),
+    Alarm(OnFailure, oneshot::Sender<Response<(), OnFailure>>),
+}
+
+impl<A: Actor> Job<A> {
+    /// Gives a job that did not begin back to its sender, which sends it
+    /// again.
+    fn resend(self) {
+        match self {
+            Job::Call(msg, reply) => reply.send(Response::Resend(msg)).ok(),
+            Job::Alarm(on_failure, done) => done.send(Response::Resend(on_failure)).ok(),
+        };
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -141,10 +152,10 @@ enum OnFailure {
     Drop,
 }
 
-enum Response<A: Actor> {
-    Done(Result<A::Reply, Error>),
-    // The call did not begin.
-    Resend(A::Msg),
+enum Response<T, M> {
+    Done(Result<T, Error>),
+    // The job did not begin.
+    Resend(M),
 }
 
 impl<A: Actor> Runtime<A> {
@@ -205,21 +216,12 @@ impl<A: Actor> Runtime<A> {
     /// An error means that the turn did not commit, so the call can be sent
     /// again, except [`Error::Commit`]. A call from [`Actor::handle`] to its
     /// own key waits for ever.
-    pub async fn call<Q>(&self, key: &Q, mut msg: A::Msg) -> Result<A::Reply, Error>
+    pub async fn call<Q>(&self, key: &Q, msg: A::Msg) -> Result<A::Reply, Error>
     where
         A::Key: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
     {
-        loop {
-            let (reply, rx) = oneshot::channel();
-            self.send(key, Job::Call(msg, reply)).await?;
-
-            match rx.await {
-                Ok(Response::Done(result)) => return result,
-                Ok(Response::Resend(m)) => msg = m,
-                Err(_) => return Err(Error::Stopped),
-            }
-        }
+        self.request(key, msg, Job::Call).await
     }
 
     /// Stops the runtime and releases the lock of its data directory.
@@ -289,10 +291,29 @@ impl<A: Actor> Runtime<A> {
     }
 
     async fn alarm(&self, key: &A::Key, on_failure: OnFailure) -> Result<(), Error> {
-        let (done, rx) = oneshot::channel();
-        self.send(key, Job::Alarm(on_failure, done)).await?;
+        self.request(key, on_failure, Job::Alarm).await
+    }
 
-        rx.await.unwrap_or(Err(Error::Stopped))
+    async fn request<Q, T, M>(
+        &self,
+        key: &Q,
+        mut input: M,
+        job: fn(M, oneshot::Sender<Response<T, M>>) -> Job<A>,
+    ) -> Result<T, Error>
+    where
+        A::Key: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = A::Key> + ?Sized,
+    {
+        loop {
+            let (reply, rx) = oneshot::channel();
+            self.send(key, job(input, reply)).await?;
+
+            match rx.await {
+                Ok(Response::Done(result)) => return result,
+                Ok(Response::Resend(back)) => input = back,
+                Err(_) => return Err(Error::Stopped),
+            }
+        }
     }
 
     async fn send<Q>(&self, key: &Q, mut job: Job<A>) -> Result<(), Error>
@@ -398,7 +419,7 @@ impl<A: Actor> Runtime<A> {
     }
 }
 
-/// Removes its entry and sends back the calls it did not serve when it
+/// Removes its entry and sends back the jobs it did not serve when it
 /// drops, also on a panic.
 struct Mailbox<A: Actor> {
     key: A::Key,
@@ -441,9 +462,7 @@ impl<A: Actor> Drop for Mailbox<A> {
         drop(registry);
 
         while let Ok(job) = self.rx.try_recv() {
-            if let Job::Call(msg, reply) = job {
-                reply.send(Response::Resend(msg)).ok();
-            }
+            job.resend();
         }
 
         self.inner.live.send_modify(|n| *n -= 1);
@@ -473,7 +492,7 @@ async fn serve<A: Actor>(mailbox: &mut Mailbox<A>) {
         Err(e) => {
             match mailbox.rx.try_recv().expect("send puts the first job in") {
                 Job::Call(_, reply) => reply.send(Response::Done(Err(e))).ok(),
-                Job::Alarm(_, done) => done.send(Err(e)).ok(),
+                Job::Alarm(_, done) => done.send(Response::Done(Err(e))).ok(),
             };
 
             return;
@@ -499,13 +518,9 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
             Err(_) => continue,
         };
 
+        // The sender gets Error::Closed when it sends the job again.
         if control.stopped() {
-            match job {
-                // The call did not begin, so the caller sends it again and
-                // gets Error::Closed.
-                Job::Call(msg, reply) => reply.send(Response::Resend(msg)).ok(),
-                Job::Alarm(_, done) => done.send(Err(Error::Closed)).ok(),
-            };
+            job.resend();
 
             return;
         }
@@ -528,7 +543,7 @@ async fn serve_turns<A: Actor>(mailbox: &mut Mailbox<A>, actor: &mut A, ctx: &mu
                 let failed = result.is_err();
 
                 if let Some(result) = inner.reply(result) {
-                    done.send(result).ok();
+                    done.send(Response::Done(result)).ok();
                 }
 
                 failed
