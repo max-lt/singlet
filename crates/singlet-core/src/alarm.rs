@@ -130,11 +130,16 @@ impl Index {
 pub(crate) fn take(counter: &std::sync::atomic::AtomicU32) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
 
-    // try_update replaces fetch_update, but Rust 1.89, the MSRV, lacks it.
-    #[allow(deprecated)]
-    counter
-        .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-        .is_ok()
+    let mut n = counter.load(SeqCst);
+
+    while n > 0 {
+        match counter.compare_exchange_weak(n, n - 1, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+
+    false
 }
 
 pub(crate) fn to_ms(at: SystemTime) -> i64 {
