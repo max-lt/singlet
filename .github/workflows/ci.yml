@@ -8,7 +8,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install nightly --profile minimal --component clippy
       - uses: taiki-e/install-action@just
       - run: just check
@@ -17,6 +17,6 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.89 --profile minimal
       - run: cargo +1.89 test
