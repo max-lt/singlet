@@ -1,3 +1,6 @@
+# CI pins it, so a new nightly lint does not fail the build
+nightly := env("NIGHTLY", "nightly")
+
 [private]
 default:
     @just --list
@@ -7,7 +10,7 @@ check:
     cargo fmt --all --check
     cargo fmt --all --check --manifest-path fuzz/Cargo.toml
     cargo clippy --all-targets -- -D warnings
-    cargo +nightly clippy --manifest-path fuzz/Cargo.toml -- -D warnings
+    cargo +{{nightly}} clippy --manifest-path fuzz/Cargo.toml -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 test:
@@ -15,7 +18,7 @@ test:
 
 # Fuzz the runtime target for `secs` seconds
 fuzz secs="300":
-    cargo +nightly fuzz run runtime -- -max_len=512 -len_control=0 -max_total_time={{secs}}
+    cargo +{{nightly}} fuzz run runtime -- -max_len=512 -len_control=0 -max_total_time={{secs}}
 
 # Remove the build output; keep the fuzz corpus
 clean:

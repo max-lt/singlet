@@ -7,9 +7,15 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Pinned, so a new Rust release does not fail the build
+    env:
+      STABLE: 1.99.0
+      NIGHTLY: nightly-2026-10-30
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install nightly --profile minimal --component clippy
+      - run: rustup toolchain install $STABLE --profile minimal --component clippy,rustfmt
+      - run: rustup toolchain install $NIGHTLY --profile minimal --component clippy
+      - run: rustup default $STABLE
       - uses: taiki-e/install-action@just
       - run: just check
       - run: just test
